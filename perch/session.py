@@ -197,6 +197,31 @@ class Session:
         argv = self.ssh_argv(remote_command)
         return self._run_capturing(argv, input=input)
 
+    def popen(self, remote_command: str) -> subprocess.Popen:
+        """Launch a long-running remote command without waiting for it (C4/P2-1).
+
+        stdout and stderr are separate pipes (ADR-2, pipe mode); stdin is
+        closed (I9 - nothing here is interactive). ensure_reachable() still
+        runs first, so an unreachable target is still a fast, classified
+        failure (P1-2) rather than a Popen that silently hangs or produces a
+        confusing ssh-level error buried in the child's own stderr.
+
+        The caller owns the Popen - reading it with selectors, waiting for
+        it, killing it - none of that is C2's job. C2's job ends at handing
+        back a correctly-constructed process.
+        """
+        self.ensure_reachable()
+        argv = self.ssh_argv(remote_command)
+        try:
+            return subprocess.Popen(
+                argv,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+        except FileNotFoundError as exc:
+            raise TargetUnreachable(f"ssh not found on this machine: {exc}") from exc
+
     def _run_capturing(self, argv: list[str], *, input: str | None = None) -> subprocess.CompletedProcess:
         try:
             return subprocess.run(

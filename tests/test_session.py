@@ -248,5 +248,50 @@ class TestRun(unittest.TestCase):
             self.assertEqual(call.args[0][-1], "true")
 
 
+class TestPopen(unittest.TestCase):
+    def test_checks_reachability_before_launching(self):
+        calls = []
+
+        def fake_run(argv, **kwargs):
+            calls.append(("run", argv))
+            return FakeCompleted(0)
+
+        class FakePopen:
+            def __init__(self, argv, **kwargs):
+                calls.append(("popen", argv))
+                self.kwargs = kwargs
+
+        with patch.object(session_mod.subprocess, "run", side_effect=fake_run), \
+             patch.object(session_mod.subprocess, "Popen", FakePopen):
+            Session("pi").popen("./ticker.sh")
+        self.assertEqual([kind for kind, _ in calls], ["run", "popen"])
+        self.assertEqual(calls[0][1][-1], "true")
+        self.assertEqual(calls[1][1][-1], "./ticker.sh")
+
+    def test_does_not_launch_when_unreachable(self):
+        completed = FakeCompleted(255, stderr="Connection timed out")
+        popen_calls = []
+        with patch.object(session_mod.subprocess, "run", return_value=completed), \
+             patch.object(session_mod.subprocess, "Popen", lambda *a, **k: popen_calls.append(1)), \
+             patch.object(session_mod.time, "sleep"):
+            with self.assertRaises(TargetUnreachable):
+                Session("pi").popen("./ticker.sh")
+        self.assertEqual(popen_calls, [])
+
+    def test_stdin_closed_stdout_stderr_are_separate_pipes(self):
+        captured = {}
+
+        class FakePopen:
+            def __init__(self, argv, **kwargs):
+                captured.update(kwargs)
+
+        with patch.object(session_mod.subprocess, "run", return_value=FakeCompleted(0)), \
+             patch.object(session_mod.subprocess, "Popen", FakePopen):
+            Session("pi").popen("./ticker.sh")
+        self.assertEqual(captured["stdin"], session_mod.subprocess.DEVNULL)
+        self.assertEqual(captured["stdout"], session_mod.subprocess.PIPE)
+        self.assertEqual(captured["stderr"], session_mod.subprocess.PIPE)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -1,0 +1,5 @@
+host = "pi"
+remote_root = "perch-integration-fixtures"
+
+[commands]
+build = "chmod +x *.sh && gcc -O0 -o slow_printer slow_printer.c"
