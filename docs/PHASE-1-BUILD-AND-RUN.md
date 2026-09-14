@@ -64,9 +64,15 @@ classified **(chosen here)**, each ending in exit 69:
 
 | Stderr contains | Classified as | Hint appended |
 |---|---|---|
-| `Connection timed out`, `Operation timed out`, `Connection refused`, `No route to host`, `Could not resolve hostname` | unreachable | "check the target is powered on and on the network" |
+| `Connection timed out`, `Operation timed out`, `Connection refused`, `No route to host`, `Could not resolve hostname`, `Network is unreachable`, `Host is down` | unreachable | "check the target is powered on and on the network" |
 | `Permission denied` | auth failure | "check ssh-agent has the right key loaded" |
 | `Host key verification failed`, `REMOTE HOST IDENTIFICATION HAS CHANGED` | host key mismatch | "run `ssh-keygen -R <alias>` if the target was reimaged, then retry" |
+
+(`Network is unreachable` and `Host is down` were added after the first pass
+missed them — macOS reports `Host is down` for an address with no host
+present on the local subnet, which is exactly what the unreachable-target
+procedure below produces, and it fell through unclassified the first time
+this was actually run against a real dead address.)
 
 Anything else at exit 255 is treated as the remote command's own exit status
 and passed through unchanged, per I6 — this is the same tradeoff already

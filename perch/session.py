@@ -4,25 +4,25 @@ Every ssh invocation in the codebase goes through this module. Nothing else
 may build an argv naming "ssh" as the program - route it through a Session.
 
 See docs/PHASE-1-BUILD-AND-RUN.md for why the numbers below (ConnectTimeout,
-ControlPersist) are what they are; that document owns the rationale so it
-doesn't drift out of sync with a second copy here.
-
-Connection-failure classification (unreachable vs. auth vs. host-key, with
-bounded retry) is P1-2, not here - this ticket is multiplexing only.
+ControlPersist, retry count) are what they are; that document owns the
+rationale so it doesn't drift out of sync with a second copy here.
 """
 
 import hashlib
 import shlex
 import subprocess
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from perch.errors import TargetUnreachable
+from perch.errors import PerchError, TargetUnreachable
 
 SSH = "ssh"
 
 DEFAULT_CONNECT_TIMEOUT = 5      # seconds
 DEFAULT_CONTROL_PERSIST = "10m"
+RECONNECT_ATTEMPTS = 2           # bounded backoff, total tries
+RECONNECT_BACKOFF = 1.0          # seconds between attempts
 
 CONTROL_SOCKET_DIR = Path.home() / ".ssh"
 
@@ -39,6 +39,54 @@ def control_path_for(alias: str, *, socket_dir: Path = CONTROL_SOCKET_DIR) -> Pa
     """
     digest = hashlib.sha256(alias.encode()).hexdigest()[:16]
     return socket_dir / f"perch-{digest}.sock"
+
+
+@dataclass
+class Classification:
+    error: PerchError
+    transient: bool  # worth a bounded retry (target might be mid-boot)
+
+
+# Each ssh-level failure ssh can report on stderr, before the remote shell
+# ever ran - so there is no ambiguity here with a remote command's own output
+# (see docs/PHASE-1-BUILD-AND-RUN.md, "Classification").
+_PATTERNS: tuple[tuple[tuple[str, ...], str, str, bool], ...] = (
+    (
+        ("Connection timed out", "Operation timed out", "Connection refused",
+         "No route to host", "Could not resolve hostname",
+         "Network is unreachable", "Host is down",
+         "kex_exchange_identification"),
+        "unreachable",
+        "check the target is powered on and reachable on the network",
+        True,
+    ),
+    (
+        ("Permission denied",),
+        "authentication failed",
+        "check ssh-agent has the right key loaded",
+        False,
+    ),
+    (
+        ("Host key verification failed", "REMOTE HOST IDENTIFICATION HAS CHANGED"),
+        "host key mismatch",
+        "run `ssh-keygen -R <alias>` if the target was reimaged, then retry",
+        False,
+    ),
+)
+
+
+def classify_ssh_failure(host: str, stderr: str) -> Classification | None:
+    """Turn ssh's own connection-level stderr into a classified failure.
+
+    Returns None when exit 255 does not match a known ssh diagnostic - that
+    case is a remote command that happens to have exited 255 itself, which is
+    legal (I6) and must pass through unchanged, not be reported as unreachable.
+    """
+    for needles, kind, hint, transient in _PATTERNS:
+        if any(needle in stderr for needle in needles):
+            message = f"{host}: {kind} - {hint}"
+            return Classification(error=TargetUnreachable(message), transient=transient)
+    return None
 
 
 @dataclass
@@ -62,10 +110,7 @@ class Session:
         this multiplexing setup does not depend on - and cannot be silently
         defeated by - whatever the user's own ssh config says. It must work
         identically whether or not ~/.ssh/config has its own ControlMaster
-        lines. Verified by hand: commenting out this machine's own
-        ControlMaster/ControlPath/ControlPersist in ~/.ssh/config and
-        confirming perch still multiplexes (see
-        docs/PHASE-1-BUILD-AND-RUN.md).
+        lines.
         """
         return [
             "-o", "ControlMaster=auto",
@@ -98,13 +143,40 @@ class Session:
         )
         return completed.returncode == 0
 
+    def ensure_reachable(self) -> None:
+        """Fail fast and classified before anything tries to run on the target.
+
+        Raises a classified PerchError (never a raw exception) if the target
+        cannot be reached, so a caller never needs its own connection-failure
+        handling. On success, the control master this call establishes is
+        reused by whatever runs next - see the module docstring.
+        """
+        last: Classification | None = None
+        for attempt in range(1, RECONNECT_ATTEMPTS + 1):
+            completed = self._run_capturing(self.ssh_argv("true"))
+            if completed.returncode != 255:
+                return
+            classification = classify_ssh_failure(self.host, completed.stderr)
+            if classification is None:
+                # 255, but not a recognized ssh-level failure - treat the
+                # connection as fine and let the caller's real command surface
+                # whatever this actually was.
+                return
+            last = classification
+            if not classification.transient or attempt == RECONNECT_ATTEMPTS:
+                raise classification.error
+            time.sleep(RECONNECT_BACKOFF)
+        assert last is not None  # loop always returns or raises above
+        raise last.error
+
     def run(self, remote_command: str, *, input: str | None = None) -> subprocess.CompletedProcess:
         """Run one command on the target, stdio inherited so output is verbatim (I8).
 
-        Connection failures still surface as ssh's own exit 255 here,
-        undifferentiated from a remote command that happens to exit 255
-        itself - P1-2 replaces that with classification and a bounded retry.
+        Raises a classified PerchError if the target is unreachable, before
+        ever attempting `remote_command` - never lets a raw connection failure
+        (a Python OSError, an unclassified ssh exit) reach the caller.
         """
+        self.ensure_reachable()
         argv = self.ssh_argv(remote_command)
         try:
             return subprocess.run(
@@ -118,10 +190,14 @@ class Session:
     def run_capturing(self, remote_command: str, *, input: str | None = None) -> subprocess.CompletedProcess:
         """Like run(), but captures stdout/stderr as text instead of inheriting.
 
-        For callers that need to parse the output (doctor's probe script,
-        P1-3) rather than show it to a human live.
+        For callers that need to parse the output (doctor's probe script)
+        rather than show it to a human live.
         """
+        self.ensure_reachable()
         argv = self.ssh_argv(remote_command)
+        return self._run_capturing(argv, input=input)
+
+    def _run_capturing(self, argv: list[str], *, input: str | None = None) -> subprocess.CompletedProcess:
         try:
             return subprocess.run(
                 argv,
