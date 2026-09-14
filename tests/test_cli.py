@@ -1,15 +1,18 @@
 """C7 (draft) argument surface and the §6 sequence. Offline.
 
 Nothing here reaches a target. The sequence is asserted by substituting the
-component entry points cli.py calls.
+component entry points cli.py calls. doctor's Session methods are patched at
+the class level, since cli.py constructs its own Session internally.
 """
 
 import io
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
+from dataclasses import dataclass
 from pathlib import Path
 
 from perch import cli, config, errors, executor, mirror
+from perch.session import Session
 
 
 def make_config(**overrides) -> config.Config:
@@ -157,21 +160,124 @@ class TestArgumentSurface(unittest.TestCase):
             cli.main(["--help"])
         self.assertEqual(caught.exception.code, 0)
 
-    def test_every_phase_zero_verb_is_present(self):
+    def test_every_phase_one_verb_is_present(self):
         parser = cli.build_parser()
         actions = [a for a in parser._actions if a.dest == "verb"]
         self.assertEqual(
-            sorted(actions[0].choices), ["build", "exec", "run", "sync", "test"]
+            sorted(actions[0].choices),
+            ["build", "doctor", "exec", "run", "sync", "test"],
         )
 
     def test_no_verb_from_a_later_phase_has_leaked_in(self):
         parser = cli.build_parser()
         actions = [a for a in parser._actions if a.dest == "verb"]
-        for later in ("doctor", "pull", "logs", "shell"):
+        for later in ("pull", "logs", "shell"):
             self.assertNotIn(later, actions[0].choices)
 
     def test_help_states_that_the_mirror_deletes(self):
         self.assertIn("deletes", cli.EPILOG)
+
+    def test_help_states_doctor_is_read_only(self):
+        self.assertIn("doctor", cli.EPILOG)
+
+
+@dataclass
+class FakeCompleted:
+    returncode: int = 0
+    stdout: str = ""
+    stderr: str = ""
+
+
+class TestDoctor(unittest.TestCase):
+    """Patch Session's methods at the class level - cli.py builds its own."""
+
+    def setUp(self):
+        self.cfg = make_config()
+        self.probe_stdout = ""
+        self.alive_before = False
+        self.probe_returncode = 0
+        self.captured_input = None
+
+        def load(start=None):
+            return self.cfg
+
+        def alive(self_session):
+            return self.alive_before
+
+        def run_capturing(self_session, remote_command, *, input=None):
+            self.captured_input = input
+            self.last_remote_command = remote_command
+            return FakeCompleted(returncode=self.probe_returncode, stdout=self.probe_stdout)
+
+        for target, name, replacement in (
+            (config, "load", load),
+            (Session, "alive", alive),
+            (Session, "run_capturing", run_capturing),
+        ):
+            original = getattr(target, name)
+            setattr(target, name, replacement)
+            self.addCleanup(setattr, target, name, original)
+
+    def invoke(self):
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            code = cli.main(["doctor"])
+        return code, out.getvalue(), err.getvalue()
+
+    def test_probe_sent_over_stdin_not_the_command_line(self):
+        self.probe_stdout = "PERCH:os=Debian\n"
+        self.invoke()
+        self.assertEqual(self.last_remote_command, "sh -s")
+        self.assertIn("PERCH:", self.captured_input)
+
+    def test_report_includes_parsed_fields(self):
+        self.probe_stdout = "\n".join(
+            [
+                "PERCH:os=Debian GNU/Linux 13 (trixie)",
+                "PERCH:kernel=6.6.51+rpt-rpi-v8",
+                "PERCH:arch=aarch64",
+                "PERCH:tool_gcc=__MISSING__",
+            ]
+        )
+        code, out, _ = self.invoke()
+        self.assertEqual(code, 0)
+        self.assertIn("Debian GNU/Linux 13 (trixie)", out)
+        self.assertIn("aarch64", out)
+
+    def test_missing_tool_reports_as_missing_not_a_failure(self):
+        self.probe_stdout = "PERCH:tool_gcc=__MISSING__\n"
+        code, out, _ = self.invoke()
+        self.assertEqual(code, 0)
+        self.assertIn("MISSING", out)
+
+    def test_does_not_sync(self):
+        # doctor is read-only - mirror.push must never be called.
+        calls = []
+        original = mirror.push
+        mirror.push = lambda *a, **k: calls.append("mirror")
+        self.addCleanup(setattr, mirror, "push", original)
+        self.invoke()
+        self.assertEqual(calls, [])
+
+    def test_nonzero_probe_is_an_internal_error_not_a_traceback(self):
+        self.probe_returncode = 1
+        code, _, err = self.invoke()
+        self.assertEqual(code, 70)
+        self.assertIn("perch:", err)
+
+
+class TestParseProbeOutput(unittest.TestCase):
+    def test_parses_tagged_lines(self):
+        text = "PERCH:os=Debian\nPERCH:arch=aarch64\n"
+        self.assertEqual(cli.parse_probe_output(text), {"os": "Debian", "arch": "aarch64"})
+
+    def test_ignores_untagged_lines(self):
+        text = "some banner\nPERCH:os=Debian\nWarning: something\n"
+        self.assertEqual(cli.parse_probe_output(text), {"os": "Debian"})
+
+    def test_value_may_contain_an_equals_sign(self):
+        text = "PERCH:tool_make=GNU Make 4.3=extra\n"
+        self.assertEqual(cli.parse_probe_output(text)["tool_make"], "GNU Make 4.3=extra")
 
 
 if __name__ == "__main__":
