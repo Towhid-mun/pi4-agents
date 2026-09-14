@@ -304,6 +304,50 @@ may live.
 what ran is always what was on disk when you asked. *Revisit only if* measured
 sync time becomes the dominant term in loop latency.
 
+**ADR-5 — The remote command runs inside a small wrapper script, not bare.**
+Every command C4 launches is wrapped as `setsid --wait bash -c '...'` with
+`trap '' PIPE HUP` set before anything else runs, and (P2-1) `stdbuf -oL -eL`
+around the user's own command when available. Three separate, empirically
+justified reasons, recorded together because they are one script:
+
+- *`setsid --wait`, not bare `setsid`.* Plain `setsid` forks and returns
+  immediately when the caller is already a process-group leader, which can
+  let the ssh channel report the command "done" before the detached child
+  has run at all. `--wait` (util-linux ≥ 2.32; confirmed on target: 2.41)
+  keeps the visible process alive until the real one exits, so the channel's
+  lifetime always matches the command's.
+- *`trap '' PIPE HUP`.* Confirmed by spike S0-2 (Phase 2 T0): with no trap,
+  `kill -9`-ing the **local** ssh client kills the **remote** process group
+  within about a second, on its very next write — not because sshd
+  deliberately tears it down, but because bash's default SIGPIPE disposition
+  terminates it the moment a write to the now-broken channel fails. Isolated
+  by testing traps individually: `trap '' PIPE` alone was sufficient;
+  `HUP` is kept too as a defensive no-cost second case for a graceful-looking
+  disconnect that a differently-configured sshd might turn into SIGHUP
+  instead. Without this, I7 ("no orphans") would hold **by accident** for a
+  process that writes often, and silently fail for one that doesn't — e.g. a
+  single long compile step with no output for 30s, disconnected mid-compile,
+  would leave a genuine, undetected orphan. P2-3's explicit kill and P2-4's
+  reaping are what actually make I7 hold; this trap is what makes that
+  mechanism the only thing responsible for it, rather than an accident of
+  timing.
+- *`stdbuf -oL -eL`.* gcc, make and python3 detect a pipe on their stdout and
+  switch to full block buffering, so output arrives in lumps regardless of
+  how correct the host-side reader is. `stdbuf` forces line buffering via an
+  `LD_PRELOAD` hook inherited down the process tree. It cannot help a program
+  that manages its own buffering internally (rare among the build tools this
+  project runs).
+
+*Rejected:* leaving the command bare and accepting that Ctrl-C/disconnect
+reliability depends on how chatty the program is — unacceptable, since I7 is
+an invariant, not a best-effort.
+
+*Consequence:* every remote command actually executed is
+`setsid --wait bash -c 'trap "" PIPE HUP; ...; stdbuf -oL -eL sh -c "<cmd>"'`
+(or without the `stdbuf` prefix on a target that lacks it), never `<cmd>`
+directly. Nothing here is *installed* — `setsid` and `stdbuf` are part of
+util-linux/coreutils, already present on Raspberry Pi OS — so I1 holds.
+
 ---
 
 ## 10. Build order
