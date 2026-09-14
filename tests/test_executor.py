@@ -8,6 +8,7 @@ command-string building.
 """
 
 import shlex
+import tempfile
 import unittest
 from dataclasses import dataclass
 from pathlib import Path
@@ -15,7 +16,7 @@ from unittest.mock import patch
 
 from perch import executor
 from perch.config import Config
-from perch.errors import TargetUnreachable
+from perch.errors import InternalError, TargetUnreachable
 
 
 def make_config(**overrides) -> Config:
@@ -182,6 +183,50 @@ class TestBuildWrappedCommand(unittest.TestCase):
         self.assertIn(shlex.quote(inner_expected), payload)
 
 
+class TestPgidRecord(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        patcher = patch.object(executor, "STATE_DIR", Path(self._tmp.name))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_missing_record_reads_as_none(self):
+        cfg = make_config()
+        self.assertIsNone(executor._read_pgid_record(cfg))
+
+    def test_write_then_read_round_trips(self):
+        cfg = make_config()
+        executor._write_pgid_record(cfg, 4242)
+        self.assertEqual(executor._read_pgid_record(cfg), 4242)
+
+    def test_clear_removes_it(self):
+        cfg = make_config()
+        executor._write_pgid_record(cfg, 4242)
+        executor._clear_pgid_record(cfg)
+        self.assertIsNone(executor._read_pgid_record(cfg))
+
+    def test_clearing_a_record_that_does_not_exist_does_not_raise(self):
+        executor._clear_pgid_record(make_config())  # must not raise
+
+    def test_different_projects_get_different_records(self):
+        a = make_config(remote_root="proj-a")
+        b = make_config(remote_root="proj-b")
+        executor._write_pgid_record(a, 111)
+        executor._write_pgid_record(b, 222)
+        self.assertEqual(executor._read_pgid_record(a), 111)
+        self.assertEqual(executor._read_pgid_record(b), 222)
+
+    def test_a_garbled_record_reads_as_none_rather_than_raising(self):
+        cfg = make_config()
+        path = executor.pgid_record_path(cfg)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("not-a-number")
+        self.assertIsNone(executor._read_pgid_record(cfg))
+
+
+
+
 @dataclass
 class FakeCompleted:
     returncode: int
@@ -252,6 +297,52 @@ class TestTerminateGroup(unittest.TestCase):
              patch.object(executor, "KILL_GRACE_SECONDS", 0):
             confirmed = executor._terminate_group(session, 123)
         self.assertFalse(confirmed)
+
+
+
+
+class TestReapStaleGroup(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        patcher = patch.object(executor, "STATE_DIR", Path(self._tmp.name))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_no_record_is_a_silent_no_op(self):
+        executor.reap_stale_group(make_config(), FakeSession())  # must not raise
+
+    def test_dead_record_is_just_cleared(self):
+        cfg = make_config()
+        executor._write_pgid_record(cfg, 999)
+        executor.reap_stale_group(cfg, FakeSession(alive_sequence=[False]))
+        self.assertIsNone(executor._read_pgid_record(cfg))
+
+    def test_live_orphan_is_killed_and_record_cleared(self):
+        cfg = make_config()
+        executor._write_pgid_record(cfg, 999)
+        session = FakeSession(alive_sequence=[True, False])
+        executor.reap_stale_group(cfg, session)
+        self.assertIn("kill -TERM -- -999", session.calls)
+        self.assertIsNone(executor._read_pgid_record(cfg))
+
+    def test_unreapable_orphan_raises_and_keeps_the_record(self):
+        cfg = make_config()
+        executor._write_pgid_record(cfg, 999)
+        # alive_sequence[0] is the initial reap_stale_group() liveness check;
+        # [1] and [2] are the TERM- and KILL-phase polls inside _terminate_group.
+        session = FakeSession(alive_sequence=[True, True, True])
+        with patch.object(executor, "TERM_GRACE_SECONDS", 0), \
+             patch.object(executor, "KILL_GRACE_SECONDS", 0):
+            with self.assertRaises(InternalError):
+                executor.reap_stale_group(cfg, session)
+        self.assertEqual(executor._read_pgid_record(cfg), 999)
+
+    def test_unreachable_target_leaves_the_record_for_next_time(self):
+        cfg = make_config()
+        executor._write_pgid_record(cfg, 999)
+        executor.reap_stale_group(cfg, FakeSession(raise_unreachable=True))
+        self.assertEqual(executor._read_pgid_record(cfg), 999)
 
 
 

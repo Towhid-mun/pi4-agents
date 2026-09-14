@@ -1,13 +1,14 @@
-"""C4 - remote execution: streaming, process groups, signals.
+"""C4 - remote execution: streaming, process groups, signals, stale reaping.
 
 The component where "roughly right" is a bug (ARCHITECTURE.md §5/C4). Carries
-I5 (streaming, P2-1), the process-group/sentinel protocol (P2-2), and now
-signal forwarding (P2-3) - I7. See ADR-5 for the wrapper script every command
-actually runs inside, and why.
+I5 (streaming, P2-1), the process-group/sentinel protocol (P2-2), signal
+forwarding (P2-3), and now stale-group reaping (P2-4) - I7. See ADR-5 for the
+wrapper script every command actually runs inside, and why.
 
-Stale-group reaping and pty mode are P2-4/P2-5 - not here yet.
+Pty mode is P2-5 - not here yet.
 """
 
+import hashlib
 import os
 import secrets
 import selectors
@@ -16,11 +17,12 @@ import subprocess
 import sys
 import time
 from dataclasses import dataclass
+from pathlib import Path
 
 import signal as signal_module
 
 from perch.config import Config
-from perch.errors import TargetUnreachable
+from perch.errors import InternalError, TargetUnreachable
 from perch.session import Session
 
 CHUNK_SIZE = 65536
@@ -31,6 +33,8 @@ CHUNK_SIZE = 65536
 TERM_GRACE_SECONDS = 5.0
 KILL_GRACE_SECONDS = 5.0
 POLL_INTERVAL_SECONDS = 0.3
+
+STATE_DIR = Path.home() / ".perch" / "state"
 
 
 @dataclass
@@ -108,6 +112,75 @@ def build_wrapped_command(remote_root: str, command: str, token: str) -> str:
         'exit "$STATUS"\n'
     )
     return f"setsid --wait bash -c {shlex.quote(payload)}"
+
+
+# --------------------------------------------------------------------------
+# P2-4: stale process-group record. NOT the run lock (P4-1) - this only ever
+# reacts to a CONFIRMED orphan of THIS project's own last recorded pgid. It
+# never blocks or even notices a legitimately concurrent invocation; that
+# distinction (and refusing with exit 75) is P4-1's job.
+# --------------------------------------------------------------------------
+
+def _project_key(cfg: Config) -> str:
+    digest = hashlib.sha256(f"{cfg.host}|{cfg.remote_root}".encode()).hexdigest()[:16]
+    return digest
+
+
+def pgid_record_path(cfg: Config) -> Path:
+    return STATE_DIR / _project_key(cfg) / "pgid"
+
+
+def _read_pgid_record(cfg: Config) -> int | None:
+    try:
+        text = pgid_record_path(cfg).read_text().strip()
+    except FileNotFoundError:
+        return None
+    try:
+        return int(text)
+    except ValueError:
+        return None
+
+
+def _write_pgid_record(cfg: Config, pgid: int) -> None:
+    path = pgid_record_path(cfg)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(str(pgid))
+
+
+def _clear_pgid_record(cfg: Config) -> None:
+    pgid_record_path(cfg).unlink(missing_ok=True)
+
+
+def reap_stale_group(cfg: Config, session: Session) -> None:
+    """If a previous run for this project left a live group, kill it.
+
+    Called at the start of every run. Silent no-op when there is nothing to
+    reap (the overwhelmingly common case). Test by SIGKILLing the host
+    process mid-run, which leaves an orphan by construction (ADR-5 makes the
+    remote group immune to the connection simply dropping).
+    """
+    pgid = _read_pgid_record(cfg)
+    if pgid is None:
+        return
+    try:
+        alive = _group_alive(session, pgid)
+    except TargetUnreachable:
+        return  # can't check right now; the record is left for next time
+    if not alive:
+        _clear_pgid_record(cfg)
+        return
+    print(
+        f"perch: reaping an orphaned process group ({pgid}) left by a "
+        f"previous run of this project on {cfg.host}",
+        file=sys.stderr,
+    )
+    if _terminate_group(session, pgid):
+        _clear_pgid_record(cfg)
+    else:
+        raise InternalError(
+            f"could not reap orphaned group {pgid} on {cfg.host} - it survived "
+            f"SIGKILL. Investigate on the target directly (ps -o pgid={pgid})."
+        )
 
 
 # --------------------------------------------------------------------------
@@ -200,7 +273,13 @@ def run(cfg: Config, command: str, session: Session) -> RunResult:
     connection, waits for confirmation it is dead, then reports interrupted -
     never claiming that without confirmation (I7). A second signal escalates
     to SIGKILL immediately rather than waiting out the first grace period.
+
+    Before any of that: if a previous run for this project left a live
+    group (this host process was SIGKILLed mid-run, which the ADR-5 wrapper
+    survives on purpose), reap it first (P2-4).
     """
+    reap_stale_group(cfg, session)
+
     token = new_marker_token()
     proc = session.popen(build_wrapped_command(cfg.remote_root, command, token))
 
@@ -263,6 +342,11 @@ def run(cfg: Config, command: str, session: Session) -> RunResult:
                 captured["pgid"] = int(value)
             except ValueError:
                 emit(stream, line)  # garbled marker - show it rather than trust it
+                return
+            # Recorded immediately, not deferred to a clean exit - if THIS
+            # host process gets SIGKILLed a moment from now, the next
+            # invocation still has something to reap (P2-4).
+            _write_pgid_record(cfg, captured["pgid"])
         elif marker_kind == "exit":
             try:
                 captured["exit_code"] = int(value)
@@ -334,6 +418,7 @@ def run(cfg: Config, command: str, session: Session) -> RunResult:
         return RunResult(exit_code=returncode, indeterminate=True)
     if captured["exit_code"] is None:
         # Stream ended without the exit sentinel - P2-6. Not success, not
-        # failure.
+        # failure. Leave the pgid record alone: we don't know it's dead.
         return RunResult(exit_code=returncode, indeterminate=True)
+    _clear_pgid_record(cfg)
     return RunResult(exit_code=captured["exit_code"])
