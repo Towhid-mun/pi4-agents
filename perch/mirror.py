@@ -15,9 +15,9 @@ from pathlib import Path
 
 from perch.config import Config
 from perch.errors import SyncError
+from perch.session import Session
 
 RSYNC = "rsync"
-SSH = "ssh"
 
 # --------------------------------------------------------------------------
 # The flag set. Do not change without reading this comment.
@@ -44,31 +44,37 @@ SSH = "ssh"
 BASE_FLAGS = ("-a", "-z", "--delete", "--checksum", "-i")
 
 
-def rsync_argv(cfg: Config, exclude_from: str) -> list[str]:
+def rsync_argv(cfg: Config, exclude_from: str, session: Session) -> list[str]:
     """The exact rsync command line for this project. Pure - runs nothing.
 
     Kept separate from push() so the flag set and the destination spelling are
     testable with no target reachable.
+
+    --rsh gives rsync's own remote-shell connection the SAME ControlPath as
+    every other invocation (C2), so it joins the multiplexed master instead of
+    paying a second full handshake. That remote-shell command line is data
+    from session.rsh_command() - nothing in this module spells out the
+    program name it runs.
     """
     source = f"{os.fspath(cfg.local_root)}{os.sep}"  # trailing sep: contents, not the dir
     destination = f"{cfg.host}:{cfg.remote_root}/"
     return [
         RSYNC,
         *BASE_FLAGS,
+        f"--rsh={session.rsh_command()}",
         f"--exclude-from={exclude_from}",
         source,
         destination,
     ]
 
 
-def mkdir_argv(cfg: Config) -> list[str]:
-    """The command that creates the remote root on first use.
+def mkdir_command(remote_root: str) -> str:
+    """The remote shell command that creates the remote root on first use.
 
-    The remote path crosses into a shell on the target, so it goes through
-    shlex.quote. No f-string command building anywhere in this codebase.
+    remote_root is data and goes through shlex.quote. No f-string command
+    building anywhere in this codebase.
     """
-    remote_command = f"mkdir -p {shlex.quote(cfg.remote_root)}"
-    return [SSH, cfg.host, remote_command]
+    return f"mkdir -p {shlex.quote(remote_root)}"
 
 
 def exclude_file_contents(cfg: Config) -> str:
@@ -76,16 +82,19 @@ def exclude_file_contents(cfg: Config) -> str:
     return "".join(f"{pattern}\n" for pattern in cfg.all_excludes)
 
 
-def push(cfg: Config) -> None:
+def push(cfg: Config, session: Session) -> None:
     """Mirror the host workspace onto the target.
 
-    Raises SyncError on any failure. The caller MUST NOT execute anything
-    against the tree if this raises - a partially synced tree is I4.
+    Raises SyncError on an rsync-specific failure, or whatever classified
+    PerchError session.run() raises if the target itself is unreachable (that
+    one is not rewrapped - it must keep its own exit code, e.g. 69, rather
+    than becoming a generic 73). The caller MUST NOT execute anything against
+    the tree if this raises - a partially synced tree is I4.
     """
     if not cfg.local_root.is_dir():
         raise SyncError(f"local root does not exist: {cfg.local_root}")
 
-    _ensure_remote_root(cfg)
+    _ensure_remote_root(cfg, session)
 
     with tempfile.NamedTemporaryFile(
         "w", prefix="perch-excludes-", suffix=".txt", delete=False
@@ -94,7 +103,7 @@ def push(cfg: Config) -> None:
         exclude_from = handle.name
 
     try:
-        argv = rsync_argv(cfg, exclude_from)
+        argv = rsync_argv(cfg, exclude_from, session)
         completed = _run(argv)
     finally:
         Path(exclude_from).unlink(missing_ok=True)
@@ -108,8 +117,11 @@ def push(cfg: Config) -> None:
         )
 
 
-def _ensure_remote_root(cfg: Config) -> None:
-    completed = _run(mkdir_argv(cfg))
+def _ensure_remote_root(cfg: Config, session: Session) -> None:
+    # session.run() itself raises a classified, unreachable-target error
+    # (exit 69) before this ever tries mkdir - that check happens here, first,
+    # for every verb, since every verb syncs before it does anything else.
+    completed = session.run(mkdir_command(cfg.remote_root))
     if completed.returncode != 0:
         raise SyncError(
             f"could not create remote root {cfg.remote_root} on {cfg.host} "
@@ -118,7 +130,7 @@ def _ensure_remote_root(cfg: Config) -> None:
 
 
 def _run(argv: list[str]) -> subprocess.CompletedProcess:
-    """Run a subprocess with stdio inherited, so its output arrives verbatim (I8)."""
+    """Run rsync with stdio inherited, so its output arrives verbatim (I8)."""
     try:
         return subprocess.run(argv)
     except FileNotFoundError as exc:

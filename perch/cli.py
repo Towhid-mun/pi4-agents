@@ -3,15 +3,11 @@
 cli.py orchestrates the sequence in ARCHITECTURE.md §6 and owns no mechanism of
 its own. Every mechanism lives in a component module.
 
-Phase 0 implements steps 1, 3, 5 and 7 only:
-
-    1 Resolve   C1 - merge project config; fail before doing anything else
-    3 Mirror    C3 - push changes; abort on partial sync (I4)
-    5 Execute   C4 - run in the remote project root
-    7 Settle    propagate exit status
-
-Step 2 (Attach) is P1-1, step 4 (Claim) is P4-1, and step 6 (Stream through
-the diagnostic mapper) is P2-1/P3-1. Artifact auto-pull in step 7 is P4-2.
+Phase 0 implemented steps 1, 3, 5 and 7. P1-1 adds step 2 (Attach - C2,
+session.py) underneath every other step: a single Session per invocation,
+reused for the mirror's rsync and the command's ssh alike. Step 4 (Claim) is
+P4-1, step 6 (Stream through the diagnostic mapper) is P2-1/P3-1. Artifact
+auto-pull in step 7 is P4-2.
 """
 
 import argparse
@@ -19,6 +15,7 @@ import sys
 
 from perch import __version__, config, errors, executor, mirror
 from perch.config import COMMAND_VERBS
+from perch.session import Session
 
 EPILOG = """\
 The target's copy of the workspace is derived and disposable: the mirror
@@ -96,7 +93,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"perch: {exc}", file=sys.stderr)
         return errors.exit_code_for(exc)
     except KeyboardInterrupt:
-        # Phase 0 is signal-naive by design (P2-3 owns this). We did not
+        # Phase 0/1 are signal-naive by design (P2-3 owns this). We did not
         # forward the interrupt and we have not confirmed that anything on the
         # target is dead, so exiting 130 would be a lie about I7. The state of
         # the run is genuinely unknown, which is what 74 means.
@@ -112,8 +109,13 @@ def _dispatch(args: argparse.Namespace) -> int:
     # 1 Resolve. Fail on an unresolvable target before doing anything else.
     cfg = config.load()
 
+    # 2 Attach. One Session per invocation, reused for every step below -
+    # this is what makes the mirror's rsync and the command's ssh share one
+    # multiplexed connection instead of each paying their own handshake.
+    session = Session(cfg.host)
+
     # 3 Mirror. Raises SyncError, which aborts before step 5 (I4).
-    mirror.push(cfg)
+    mirror.push(cfg, session)
 
     if args.verb == "sync":
         return errors.EXIT_OK
@@ -121,9 +123,9 @@ def _dispatch(args: argparse.Namespace) -> int:
     command = _command_for(cfg, args)
 
     # 5 Execute.
-    result = executor.run(cfg, command)
+    result = executor.run(cfg, command, session)
 
-    # 7 Settle. Phase 0 settles by propagating the status and nothing else.
+    # 7 Settle. Phase 0/1 settle by propagating the status and nothing else.
     return errors.exit_code_for_remote(result.exit_code)
 
 

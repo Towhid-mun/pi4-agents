@@ -1,10 +1,12 @@
 """C4 (draft) command construction. Offline.
 
 Only the pure parts are tested here. Actual execution needs a target and is
-integration work; P2 replaces this module anyway.
+integration work; P2 replaces this module anyway. session.run() is faked - a
+real Session would touch the network.
 """
 
 import unittest
+from dataclasses import dataclass
 from pathlib import Path
 
 from perch import executor
@@ -22,6 +24,21 @@ def make_config(**overrides) -> Config:
     )
     defaults.update(overrides)
     return Config(**defaults)
+
+
+@dataclass
+class FakeCompleted:
+    returncode: int
+
+
+class FakeSession:
+    def __init__(self, returncode: int = 0):
+        self.returncode = returncode
+        self.run_calls: list[str] = []
+
+    def run(self, remote_command: str):
+        self.run_calls.append(remote_command)
+        return FakeCompleted(returncode=self.returncode)
 
 
 class TestRemoteCommand(unittest.TestCase):
@@ -61,18 +78,19 @@ class TestJoin(unittest.TestCase):
         self.assertEqual(joined, "echo '; rm -rf ~'")
 
 
-class TestSshArgv(unittest.TestCase):
-    def test_shape(self):
-        argv = executor.ssh_argv(make_config(), "uname -m")
-        self.assertEqual(argv, ["ssh", "pi", "cd projects/blinky && uname -m"])
+class TestRun(unittest.TestCase):
+    def test_runs_through_the_session_cding_into_the_remote_root(self):
+        session = FakeSession(returncode=0)
+        result = executor.run(make_config(), "make -j4", session)
+        self.assertEqual(session.run_calls, ["cd projects/blinky && make -j4"])
+        self.assertEqual(result.exit_code, 0)
 
-    def test_uses_the_alias_only(self):
-        # I10: user, address and port live in ~/.ssh/config, never here.
-        argv = executor.ssh_argv(make_config(), "true")
-        joined = " ".join(argv)
-        self.assertNotIn("@", joined)
-        self.assertNotIn("-p ", joined)
-        self.assertNotIn("-i ", joined)
+    def test_exit_code_passes_through_unchanged(self):
+        # I6, including a code that collides with ssh's own 255.
+        for code in (0, 1, 63, 127, 255):
+            with self.subTest(code=code):
+                result = executor.run(make_config(), "true", FakeSession(returncode=code))
+                self.assertEqual(result.exit_code, code)
 
 
 class TestRunResult(unittest.TestCase):
@@ -82,7 +100,7 @@ class TestRunResult(unittest.TestCase):
         self.assertFalse(result.indeterminate)
 
 
-class TestPhaseZeroHonesty(unittest.TestCase):
+class TestPhaseHonesty(unittest.TestCase):
     def test_module_is_marked_as_replaced_in_p2(self):
         source = Path(executor.__file__).read_text()
         self.assertIn("# REPLACED IN P2", source)

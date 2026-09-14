@@ -3,7 +3,8 @@
 # REPLACED IN P2
 #
 # This is the walking-skeleton executor and it is deliberately crude. Every
-# guarantee C4 is supposed to carry is missing here:
+# guarantee C4 is supposed to carry beyond what P1-1/P1-2 added is missing
+# here:
 #
 #   I5 (streaming)  - stdio is inherited, so output happens to reach the
 #                     terminal promptly, but stdout and stderr are NOT read
@@ -21,13 +22,10 @@
 """
 
 import shlex
-import subprocess
 from dataclasses import dataclass
 
 from perch.config import Config
-from perch.errors import TargetUnreachable
-
-SSH = "ssh"
+from perch.session import Session
 
 
 @dataclass
@@ -49,36 +47,22 @@ def remote_command(remote_root: str, command: str) -> str:
     return f"cd {shlex.quote(remote_root)} && {command}"
 
 
-def ssh_argv(cfg: Config, command: str) -> list[str]:
-    """The exact ssh command line. Pure - runs nothing.
-
-    P1-1 replaces this: every ssh invocation moves into C2 and gains
-    ControlMaster, ControlPath, ControlPersist and an explicit ConnectTimeout.
-    Until then there is no multiplexing and no timeout, which is why a
-    powered-off board hangs instead of exiting 69.
-    """
-    return [SSH, cfg.host, remote_command(cfg.remote_root, command)]
-
-
 def join(argv: list[str]) -> str:
     """Turn a local argv into one safely quoted remote shell string."""
     return shlex.join(argv)
 
 
-def run(cfg: Config, command: str) -> RunResult:
+def run(cfg: Config, command: str, session: Session) -> RunResult:
     """Run `command` in the remote project root and propagate its exit status.
 
+    Connection failures are classified and raised by session.run() itself
+    (exit 69, P1-2) before this command is even attempted. Once it does run,
     stdio is inherited, so the target's output reaches this terminal verbatim
     (I8) and its exit status becomes ours (I6).
     """
-    argv = ssh_argv(cfg, command)
-    try:
-        completed = subprocess.run(argv)
-    except FileNotFoundError as exc:
-        raise TargetUnreachable(f"ssh not found on this machine: {exc}") from exc
+    completed = session.run(remote_command(cfg.remote_root, command))
 
-    # ssh reports its own failures as 255, which is indistinguishable here from
-    # a remote command that genuinely exited 255. I6 says the remote status
-    # wins, so it passes through untouched. P1-2 classifies connection failures
-    # properly and turns the unreachable case into exit 69.
+    # A remote command that happens to exit 255 itself is legal (I6) and
+    # session.run() already told the difference from a real connection
+    # failure - by the time we're here, 255 just means 255.
     return RunResult(exit_code=completed.returncode)

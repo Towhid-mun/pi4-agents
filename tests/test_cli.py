@@ -39,12 +39,12 @@ class SequenceTestCase(unittest.TestCase):
             self.calls.append(("resolve", None))
             return self.cfg
 
-        def push(cfg):
+        def push(cfg, session):
             self.calls.append(("mirror", None))
             if self.sync_error is not None:
                 raise self.sync_error
 
-        def run(cfg, command):
+        def run(cfg, command, session):
             self.calls.append(("execute", command))
             return executor.RunResult(exit_code=self.exit_code)
 
