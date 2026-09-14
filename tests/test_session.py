@@ -115,6 +115,23 @@ class TestRshCommand(unittest.TestCase):
         self.assertIn(str(session.control_path), session.rsh_command())
 
 
+class TestPtyArgv(unittest.TestCase):
+    def test_forces_pty_allocation(self):
+        argv = Session("pi").pty_argv("cd root && make")
+        self.assertEqual(argv[0], "ssh")
+        self.assertIn("-tt", argv)
+
+    def test_carries_the_same_multiplexing_options(self):
+        session = Session("pi")
+        argv = session.pty_argv("true")
+        self.assertIn(f"ControlPath={session.control_path}", argv)
+
+    def test_shape(self):
+        argv = Session("pi").pty_argv("cd root && make")
+        self.assertEqual(argv[-2], "pi")
+        self.assertEqual(argv[-1], "cd root && make")
+
+
 class TestClassifySshFailure(unittest.TestCase):
     def test_connection_timed_out_is_unreachable_and_transient(self):
         result = classify_ssh_failure("pi", "ssh: connect to host 10.0.0.99 port 22: Operation timed out\n")

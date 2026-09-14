@@ -73,6 +73,23 @@ def build_parser() -> argparse.ArgumentParser:
             help=f"extra arguments appended to commands.{verb}",
         )
 
+    # --tty and --json apply to every verb that actually runs a command.
+    # exec's REMAINDER would swallow them if placed after the command, so
+    # they only work before the command/args - documented in --help.
+    for sub in (execute, *[verbs.choices[v] for v in COMMAND_VERBS]):
+        sub.add_argument(
+            "--tty",
+            action="store_true",
+            help="allocate a pty for an interactive remote program (ADR-2); "
+            "never combine with --json",
+        )
+        sub.add_argument(
+            "--json",
+            action="store_true",
+            help="structured event stream on stdout (Phase 3 - not yet "
+            "implemented; recognized now only so --tty --json can be refused)",
+        )
+
     return parser
 
 
@@ -140,8 +157,21 @@ def _dispatch(args: argparse.Namespace) -> int:
 
     command = _command_for(cfg, args)
 
+    tty = getattr(args, "tty", False)
+    json_sink = getattr(args, "json", False)
+    if tty and json_sink:
+        # P2-5: a pty's streams are merged and carry control characters -
+        # C5 (Phase 3) cannot classify that into structured events. Refused
+        # here, not deeper in, so this is a config error (64) rather than
+        # something that fails midway through a run.
+        raise errors.ConfigError(
+            "--tty and --json cannot be combined: a pty merges stdout and "
+            "stderr into one stream, which cannot be classified into "
+            "structured events"
+        )
+
     # 5 Execute.
-    result = executor.run(cfg, command, session)
+    result = executor.run(cfg, command, session, tty=tty)
 
     # 7 Settle. Phase 0/1 settled by propagating the status alone; P2 adds
     # the interrupted/indeterminate outcomes C4 can now report (I7's exit

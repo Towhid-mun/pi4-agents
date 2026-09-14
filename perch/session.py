@@ -233,3 +233,13 @@ class Session:
             )
         except FileNotFoundError as exc:
             raise TargetUnreachable(f"ssh not found on this machine: {exc}") from exc
+
+    def pty_argv(self, remote_command: str) -> list[str]:
+        """The ssh command line for --tty mode: ssh -tt, forcing pty allocation.
+
+        Pure - runs nothing. P2-5 uses this directly since a pty session is
+        inherited wholesale (stdin/stdout/stderr all connected to the local
+        terminal) rather than read with selectors - there is nothing for C2
+        to do beyond handing back the right argv.
+        """
+        return [SSH, "-tt", *self.base_ssh_options(), self.host, remote_command]

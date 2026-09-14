@@ -47,8 +47,9 @@ class SequenceTestCase(unittest.TestCase):
             if self.sync_error is not None:
                 raise self.sync_error
 
-        def run(cfg, command, session):
+        def run(cfg, command, session, *, tty=False):
             self.calls.append(("execute", command))
+            self.last_tty = tty
             return executor.RunResult(exit_code=self.exit_code)
 
         for module, name, replacement in (
@@ -144,6 +145,35 @@ class TestExitStatus(SequenceTestCase):
                 self.exit_code = code
                 observed, _, _ = self.invoke(["build"])
                 self.assertEqual(observed, code)
+
+
+class TestTtyAndJson(SequenceTestCase):
+    def test_tty_flag_reaches_the_executor(self):
+        self.invoke(["build", "--tty"])
+        self.assertTrue(self.last_tty)
+
+    def test_tty_defaults_to_false(self):
+        self.invoke(["build"])
+        self.assertFalse(self.last_tty)
+
+    def test_tty_and_json_together_is_refused(self):
+        # P2-5: a pty's streams are merged and carry control characters -
+        # cannot be classified into structured events (Phase 3).
+        code, _, err = self.invoke(["build", "--tty", "--json"])
+        self.assertEqual(code, 64)
+        self.assertIn("--tty", err)
+        self.assertIn("--json", err)
+        self.assertNotIn("execute", [step for step, _ in self.calls])
+
+    def test_json_alone_is_accepted_for_now(self):
+        # --json is recognized now (P2-5's combination check needs it to
+        # exist) but does nothing on its own until P3-3.
+        code, _, _ = self.invoke(["build", "--json"])
+        self.assertEqual(code, 0)
+
+    def test_tty_works_on_exec_too(self):
+        self.invoke(["exec", "--tty", "true"])
+        self.assertTrue(self.last_tty)
 
 
 class TestArgumentSurface(unittest.TestCase):

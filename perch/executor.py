@@ -1,11 +1,22 @@
-"""C4 - remote execution: streaming, process groups, signals, stale reaping.
+"""C4 - remote execution: streaming, process groups, signals, pty.
 
 The component where "roughly right" is a bug (ARCHITECTURE.md §5/C4). Carries
 I5 (streaming, P2-1), the process-group/sentinel protocol (P2-2), signal
-forwarding (P2-3), and now stale-group reaping (P2-4) - I7. See ADR-5 for the
-wrapper script every command actually runs inside, and why.
+forwarding (P2-3), stale-group reaping (P2-4) and now pty mode (P2-5) - I7 in
+full, and ADR-2's second mode. See ADR-5 for the wrapper script every
+pipe-mode command actually runs inside, and why.
 
-Pty mode is P2-5 - not here yet.
+Two modes:
+
+  run(..., tty=False)  Pipes (default). Everything above - selectors,
+                        process group, signal forwarding, reaping.
+
+  run(..., tty=True)   PTY. `ssh -tt`; the kernel's own pty line discipline
+                        delivers signals to the remote foreground process
+                        group natively, so none of the marker/pgid machinery
+                        above is needed for it. The cost (ADR-2): stdout and
+                        stderr merge into one stream, so this mode cannot be
+                        combined with a structured (--json) sink.
 """
 
 import hashlib
@@ -15,7 +26,9 @@ import selectors
 import shlex
 import subprocess
 import sys
+import termios
 import time
+import tty as tty_module
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -259,7 +272,7 @@ class _SignalState:
         self.count += 1
 
 
-def run(cfg: Config, command: str, session: Session) -> RunResult:
+def _run_pipes(cfg: Config, command: str, session: Session) -> RunResult:
     """Run `command` in the remote project root, streaming output as it arrives.
 
     Reads stdout and stderr with `selectors` (P2-1) so neither stream can
@@ -422,3 +435,55 @@ def run(cfg: Config, command: str, session: Session) -> RunResult:
         return RunResult(exit_code=returncode, indeterminate=True)
     _clear_pgid_record(cfg)
     return RunResult(exit_code=captured["exit_code"])
+
+
+# --------------------------------------------------------------------------
+# PTY mode (P2-5).
+# --------------------------------------------------------------------------
+
+def _run_pty(cfg: Config, command: str, session: Session) -> RunResult:
+    """`ssh -tt`, with the local terminal put in raw mode for the duration.
+
+    No marker/pgid machinery here - ADR-2's trade for pty mode is that the
+    kernel's own pty line discipline delivers signals to the remote
+    foreground process group natively, so C4 does not need to do it. The
+    cost is the one this mode is opt-in for: stdout and stderr merge into a
+    single stream, so it cannot be classified (--json refuses the combination
+    in cli.py).
+    """
+    session.ensure_reachable()
+    argv = session.pty_argv(remote_command(cfg.remote_root, command))
+
+    old_termios = None
+    stdin_fd = sys.stdin.fileno()
+    try:
+        if sys.stdin.isatty():
+            old_termios = termios.tcgetattr(stdin_fd)
+            tty_module.setraw(stdin_fd)
+        completed = subprocess.run(argv)
+    finally:
+        # MUST restore even if something above raised - an unrestored
+        # terminal leaves the user's shell echo-less and they have to type
+        # `reset` blind. Tested against the actual exception path, not just
+        # the happy one: a broken ssh binary path raises FileNotFoundError
+        # here and termios is still back to normal afterward.
+        if old_termios is not None:
+            termios.tcsetattr(stdin_fd, termios.TCSADRAIN, old_termios)
+
+    return RunResult(exit_code=completed.returncode)
+
+
+# --------------------------------------------------------------------------
+# Public entry point.
+# --------------------------------------------------------------------------
+
+def run(cfg: Config, command: str, session: Session, *, tty: bool = False) -> RunResult:
+    """Run `command` in the remote project root and propagate its outcome.
+
+    Pipe mode (default) carries I5/I6/I7 in full - see _run_pipes. PTY mode
+    (--tty) trades stream separation for native signal delivery (ADR-2) and
+    is never the default.
+    """
+    if tty:
+        return _run_pty(cfg, command, session)
+    return _run_pipes(cfg, command, session)
