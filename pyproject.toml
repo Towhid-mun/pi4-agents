@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "perch"
+version = "0.1.0"
+description = "Remote build-and-run bridge: author on macOS, compile and run on a Raspberry Pi over SSH."
+requires-python = ">=3.11"
+# Standard library only (ARCHITECTURE.md §3). Adding a dependency here
+# requires an ADR in ARCHITECTURE.md §9.
+dependencies = []
+
+[project.scripts]
+perch = "perch.cli:main"
+
+[tool.setuptools]
+packages = ["perch"]
