@@ -62,3 +62,5 @@ Open questions
 Sync trigger: explicit per command, or a watcher keeping the target continuously current? Explicit is simpler to reason about; continuous is faster in a tight loop.
 Path mapping: rewrite diagnostics in transit, or mirror the workspace path on the target so no rewriting is needed? The second is cheaper but constrains the target's directory layout.
 Concurrency: what happens when a build is triggered while a previous run is still executing on the target?
+
+Running it: see docs/.
