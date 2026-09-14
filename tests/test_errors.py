@@ -63,6 +63,23 @@ class TestExitCodeMap(unittest.TestCase):
             errors.exit_code_for_remote(None)
 
 
+class TestExitCodeForRun(unittest.TestCase):
+    def test_ordinary_completion_passes_through(self):
+        self.assertEqual(errors.exit_code_for_run(0), 0)
+        self.assertEqual(errors.exit_code_for_run(1), 1)
+
+    def test_interrupted_is_130_regardless_of_exit_code(self):
+        self.assertEqual(errors.exit_code_for_run(17, interrupted=True), 130)
+
+    def test_indeterminate_is_74_regardless_of_exit_code(self):
+        self.assertEqual(errors.exit_code_for_run(17, indeterminate=True), 74)
+
+    def test_indeterminate_wins_over_interrupted(self):
+        self.assertEqual(
+            errors.exit_code_for_run(0, interrupted=True, indeterminate=True), 74
+        )
+
+
 class TestVersion(unittest.TestCase):
     def test_version_is_importable(self):
         from perch import __version__

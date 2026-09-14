@@ -9,10 +9,13 @@ command-string building.
 
 import shlex
 import unittest
+from dataclasses import dataclass
 from pathlib import Path
+from unittest.mock import patch
 
 from perch import executor
 from perch.config import Config
+from perch.errors import TargetUnreachable
 
 
 def make_config(**overrides) -> Config:
@@ -177,6 +180,80 @@ class TestBuildWrappedCommand(unittest.TestCase):
         # argument, not as a second top-level statement of the payload.
         inner_expected = f"cd root && {hostile}"
         self.assertIn(shlex.quote(inner_expected), payload)
+
+
+@dataclass
+class FakeCompleted:
+    returncode: int
+    stdout: str = ""
+    stderr: str = ""
+
+
+class FakeSession:
+    """A session double for the kill/confirm/reap helpers - no network."""
+
+    def __init__(self, alive_sequence=(), raise_unreachable=False):
+        self.alive_sequence = list(alive_sequence)
+        self.raise_unreachable = raise_unreachable
+        self.calls: list[str] = []
+
+    def run_capturing(self, remote_command: str, *, input=None):
+        self.calls.append(remote_command)
+        if self.raise_unreachable:
+            raise TargetUnreachable("pi: unreachable")
+        if remote_command.startswith("pgrep"):
+            alive = self.alive_sequence.pop(0) if self.alive_sequence else False
+            return FakeCompleted(returncode=0 if alive else 1)
+        return FakeCompleted(returncode=0)
+
+
+class TestGroupAlive(unittest.TestCase):
+    def test_pgrep_zero_is_alive(self):
+        self.assertTrue(executor._group_alive(FakeSession(alive_sequence=[True]), 123))
+
+    def test_pgrep_nonzero_is_dead(self):
+        self.assertFalse(executor._group_alive(FakeSession(alive_sequence=[False]), 123))
+
+    def test_unreachable_propagates_rather_than_guessing(self):
+        with self.assertRaises(TargetUnreachable):
+            executor._group_alive(FakeSession(raise_unreachable=True), 123)
+
+
+class TestTerminateGroup(unittest.TestCase):
+    def test_dead_after_term_alone(self):
+        session = FakeSession(alive_sequence=[False])
+        self.assertTrue(executor._terminate_group(session, 123))
+        self.assertIn("kill -TERM -- -123", session.calls)
+        self.assertNotIn("kill -KILL -- -123", session.calls)
+
+    def test_escalates_to_kill_when_term_does_not_work(self):
+        # Still alive right after TERM (grace=0 -> exactly one poll, then the
+        # deadline is already past), dead only after KILL. grace=0 removes
+        # any dependence on real elapsed time, so this is deterministic.
+        session = FakeSession(alive_sequence=[True, False])
+        with patch.object(executor, "TERM_GRACE_SECONDS", 0), \
+             patch.object(executor, "KILL_GRACE_SECONDS", 5.0):
+            confirmed = executor._terminate_group(session, 123)
+        self.assertTrue(confirmed)
+        self.assertEqual(
+            session.calls,
+            ["kill -TERM -- -123", "pgrep -g 123", "kill -KILL -- -123", "pgrep -g 123"],
+        )
+
+    def test_escalate_immediately_skips_term(self):
+        session = FakeSession(alive_sequence=[False])
+        executor._terminate_group(session, 123, escalate_immediately=True)
+        self.assertNotIn("kill -TERM -- -123", session.calls)
+        self.assertIn("kill -KILL -- -123", session.calls)
+
+    def test_survives_kill_reports_not_confirmed(self):
+        session = FakeSession(alive_sequence=[True, True])
+        with patch.object(executor, "TERM_GRACE_SECONDS", 0), \
+             patch.object(executor, "KILL_GRACE_SECONDS", 0):
+            confirmed = executor._terminate_group(session, 123)
+        self.assertFalse(confirmed)
+
+
 
 
 class TestRunResult(unittest.TestCase):

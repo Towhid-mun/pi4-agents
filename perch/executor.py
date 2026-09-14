@@ -1,25 +1,36 @@
-"""C4 - remote execution: streaming, process groups, exit sentinel.
+"""C4 - remote execution: streaming, process groups, signals.
 
 The component where "roughly right" is a bug (ARCHITECTURE.md §5/C4). Carries
-I5 (streaming, P2-1) and now the process-group/sentinel protocol (P2-2) that
-signal forwarding (P2-3) and indeterminate detection (P2-6) both build on.
-See ADR-5 for the wrapper script every command actually runs inside, and why.
+I5 (streaming, P2-1), the process-group/sentinel protocol (P2-2), and now
+signal forwarding (P2-3) - I7. See ADR-5 for the wrapper script every command
+actually runs inside, and why.
 
-Signal forwarding, stale-group reaping and pty mode are P2-3 through P2-5 -
-not here yet.
+Stale-group reaping and pty mode are P2-4/P2-5 - not here yet.
 """
 
 import os
 import secrets
 import selectors
 import shlex
+import subprocess
 import sys
+import time
 from dataclasses import dataclass
 
+import signal as signal_module
+
 from perch.config import Config
+from perch.errors import TargetUnreachable
 from perch.session import Session
 
 CHUNK_SIZE = 65536
+
+# How long we wait, per escalation step, before giving up and reporting that
+# the kill could not be confirmed. Bounded, per P2-3 - this is not allowed to
+# hang forever.
+TERM_GRACE_SECONDS = 5.0
+KILL_GRACE_SECONDS = 5.0
+POLL_INTERVAL_SECONDS = 0.3
 
 
 @dataclass
@@ -81,14 +92,6 @@ def build_wrapped_command(remote_root: str, command: str, token: str) -> str:
 
     setsid --wait bash -c '<payload>' - see ARCHITECTURE.md ADR-5 for why
     each piece of the payload is there (--wait, the PIPE/HUP trap, stdbuf).
-    The payload: trap SIGPIPE/SIGHUP so a broken channel does not kill the
-    group by accident (S0-2's finding), resolve the REAL pgid via `ps` rather
-    than trusting $$ (setsid can fork when the caller is already a group
-    leader), print it on a marked line before the program's own output
-    begins, run the program (line-buffered via stdbuf when available), then
-    print a second marked line carrying its real exit status - the sentinel
-    that disambiguates a genuine remote 255 from ssh's own connection-level
-    255 (P2-6 depends on this).
     """
     inner_quoted = shlex.quote(remote_command(remote_root, command))
     payload = (
@@ -107,17 +110,96 @@ def build_wrapped_command(remote_root: str, command: str, token: str) -> str:
     return f"setsid --wait bash -c {shlex.quote(payload)}"
 
 
+# --------------------------------------------------------------------------
+# Kill + confirm (P2-3). Always a SEPARATE connection (a fresh
+# session.run_capturing() call) from whatever long-running Popen is being
+# killed - the existing one may be exactly what is wedged. Multiplexing
+# makes this cheap.
+# --------------------------------------------------------------------------
+
+def _group_alive(session: Session, pgid: int) -> bool:
+    """Raises TargetUnreachable if we can't even check - never guess yes/no
+    silently on a connectivity failure; let the caller decide what that means."""
+    completed = session.run_capturing(f"pgrep -g {pgid}")
+    return completed.returncode == 0
+
+
+def _send_signal(session: Session, pgid: int, sig_name: str) -> None:
+    try:
+        session.run_capturing(f"kill -{sig_name} -- -{pgid}")
+    except TargetUnreachable:
+        pass  # the alive()-polling below will surface the same problem
+
+
+def _poll_until_dead(session: Session, pgid: int, grace_seconds: float, should_escalate) -> bool:
+    """False means "stop waiting" - either the deadline passed, or
+    `should_escalate()` says a second Ctrl-C arrived. Checked every poll
+    tick (~POLL_INTERVAL_SECONDS), not just once before this call started -
+    a naive one-time check would block for the FULL grace period even after
+    a second signal, since this function is what's running when it arrives.
+    """
+    deadline = time.monotonic() + grace_seconds
+    while True:
+        try:
+            if not _group_alive(session, pgid):
+                return True
+        except TargetUnreachable:
+            pass  # keep trying until the deadline; report the honest outcome then
+        if should_escalate() or time.monotonic() >= deadline:
+            return False
+        time.sleep(POLL_INTERVAL_SECONDS)
+
+
+def _terminate_group(
+    session: Session,
+    pgid: int,
+    *,
+    escalate_immediately: bool = False,
+    should_escalate=lambda: False,
+) -> bool:
+    """TERM, wait, escalate to KILL if needed. True only once confirmed dead.
+
+    `should_escalate` is re-checked throughout the TERM wait (not just at the
+    start) so a second Ctrl-C during that wait cuts it short immediately
+    rather than being noticed only once the first attempt's grace period
+    elapses on its own.
+    """
+    if not escalate_immediately:
+        _send_signal(session, pgid, "TERM")
+        if _poll_until_dead(session, pgid, TERM_GRACE_SECONDS, should_escalate):
+            return True
+    _send_signal(session, pgid, "KILL")
+    return _poll_until_dead(session, pgid, KILL_GRACE_SECONDS, lambda: False)
+
+
+# --------------------------------------------------------------------------
+# Signal state. The OS handler only ever does this - a plain counter bump.
+# All the actual work (opening a connection, sending a kill, polling) happens
+# in the main read loop, never inside the handler itself (re-entrancy).
+# --------------------------------------------------------------------------
+
+class _SignalState:
+    def __init__(self):
+        self.count = 0
+
+    def bump(self, signum, frame):
+        self.count += 1
+
+
 def run(cfg: Config, command: str, session: Session) -> RunResult:
     """Run `command` in the remote project root, streaming output as it arrives.
 
     Reads stdout and stderr with `selectors` (P2-1) so neither stream can
     starve or deadlock the other. Marker lines are stripped from user-visible
     output and used to capture the process group id and, from the exit
-    sentinel, the command's REAL exit status - not ssh's own return code,
-    which is ambiguous between a genuine remote 255 and a connection failure.
+    sentinel, the command's REAL exit status (P2-2) - not ssh's own return
+    code, which is ambiguous between a genuine remote 255 and a connection
+    failure.
 
-    If the stream ends without ever seeing the exit sentinel, this is
-    indeterminate (P2-6) - not success, not failure.
+    A local SIGINT or SIGTERM signals the captured group from a SEPARATE
+    connection, waits for confirmation it is dead, then reports interrupted -
+    never claiming that without confirmation (I7). A second signal escalates
+    to SIGKILL immediately rather than waiting out the first grace period.
     """
     token = new_marker_token()
     proc = session.popen(build_wrapped_command(cfg.remote_root, command, token))
@@ -125,20 +207,47 @@ def run(cfg: Config, command: str, session: Session) -> RunResult:
     os.set_blocking(proc.stdout.fileno(), False)
     os.set_blocking(proc.stderr.fileno(), False)
 
+    sig_read_fd, sig_write_fd = os.pipe()
+    os.set_blocking(sig_read_fd, False)
+    os.set_blocking(sig_write_fd, False)  # set_wakeup_fd requires this on the write end too
+    previous_wakeup_fd = signal_module.set_wakeup_fd(sig_write_fd)
+
+    state = _SignalState()
+    old_int = signal_module.signal(signal_module.SIGINT, state.bump)
+    old_term = signal_module.signal(signal_module.SIGTERM, state.bump)
+
     sel = selectors.DefaultSelector()
     sel.register(proc.stdout, selectors.EVENT_READ, data="stdout")
     sel.register(proc.stderr, selectors.EVENT_READ, data="stderr")
+    sel.register(sig_read_fd, selectors.EVENT_READ, data="signal")
 
     buffers = {"stdout": bytearray(), "stderr": bytearray()}
     open_streams = {"stdout", "stderr"}
     captured = {"pgid": None, "exit_code": None}
+    handled_signal_count = 0
+    outcome = "normal"  # normal | interrupted_confirmed | interrupted_unconfirmed
+    broken = {"stdout": False, "stderr": False}  # our OWN downstream consumer went away
 
     def emit(stream: str, line: str) -> None:
         # Trap 3: our own stdout/stderr are block-buffered when not a
         # terminal. Flush every line explicitly.
+        if broken[stream]:
+            return
         out = sys.stdout if stream == "stdout" else sys.stderr
-        out.write(line + "\n")
-        out.flush()
+        try:
+            out.write(line + "\n")
+            out.flush()
+        except BrokenPipeError:
+            # Our own local consumer (e.g. `perch build | head`) went away.
+            # That is not a failure of the remote command - keep draining
+            # and let the real exit status settle normally, just stop trying
+            # to display output nobody is reading. Also redirect the real fd
+            # to /dev/null so the interpreter's own flush at shutdown doesn't
+            # hit the same broken pipe and print a scary "Exception ignored".
+            broken[stream] = True
+            devnull = os.open(os.devnull, os.O_WRONLY)
+            os.dup2(devnull, out.fileno())
+            os.close(devnull)
 
     def handle_line(stream: str, raw: bytes) -> None:
         line = raw.decode("utf-8", errors="replace")
@@ -180,13 +289,51 @@ def run(cfg: Config, command: str, session: Session) -> RunResult:
             handle_line(stream, bytes(buffers[stream][:idx]))
             del buffers[stream][: idx + 1]
 
-    while open_streams:
-        for key, _ in sel.select(timeout=0.5):
-            drain(key.data, key.fileobj)
-    sel.close()
+    try:
+        while open_streams:
+            for key, _ in sel.select(timeout=0.2):
+                if key.data == "signal":
+                    try:
+                        os.read(sig_read_fd, 4096)
+                    except BlockingIOError:
+                        pass
+                else:
+                    drain(key.data, key.fileobj)
 
-    returncode = proc.wait()
+            if state.count > handled_signal_count and captured["pgid"] is not None:
+                baseline = handled_signal_count
+                handled_signal_count = state.count
+                escalate_now = state.count >= 2
+                confirmed = _terminate_group(
+                    session,
+                    captured["pgid"],
+                    escalate_immediately=escalate_now,
+                    should_escalate=lambda: state.count > baseline + 1,
+                )
+                outcome = "interrupted_confirmed" if confirmed else "interrupted_unconfirmed"
+                break
+    finally:
+        signal_module.signal(signal_module.SIGINT, old_int)
+        signal_module.signal(signal_module.SIGTERM, old_term)
+        signal_module.set_wakeup_fd(previous_wakeup_fd)
+        sel.close()
+        os.close(sig_read_fd)
+        os.close(sig_write_fd)
 
+    try:
+        returncode = proc.wait(timeout=KILL_GRACE_SECONDS + 2)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        returncode = proc.wait()
+
+    if outcome == "interrupted_confirmed":
+        return RunResult(exit_code=returncode, interrupted=True)
+    if outcome == "interrupted_unconfirmed":
+        # NEVER claim confirmed-dead (I7) without confirmation - this is
+        # indeterminate, not interrupted, even though a human caused it.
+        return RunResult(exit_code=returncode, indeterminate=True)
     if captured["exit_code"] is None:
+        # Stream ended without the exit sentinel - P2-6. Not success, not
+        # failure.
         return RunResult(exit_code=returncode, indeterminate=True)
     return RunResult(exit_code=captured["exit_code"])

@@ -117,3 +117,24 @@ def exit_code_for(exc: BaseException) -> int:
     if isinstance(exc, PerchError):
         return exc.exit_code
     return EXIT_INTERNAL
+
+
+def exit_code_for_run(exit_code: int, *, interrupted: bool = False, indeterminate: bool = False) -> int:
+    """Map a C4 RunResult's fields to the tool's exit status (P2).
+
+    Indeterminate wins over interrupted, which wins over ordinary passthrough
+    - see ARCHITECTURE.md §7. A confirmed-dead interrupt and an indeterminate
+    run each have exactly one fixed code, regardless of whatever `exit_code`
+    happened to be in flight when they were detected; `exit_code` is only
+    consulted in the ordinary case.
+
+    Note: a remote command that happens to exit 130 or 74 entirely on its own
+    (not from anything perch did) still passes through as 130 or 74 here -
+    the same I6-over-clarity tradeoff already recorded for the 127 collision
+    in exit_code_for_remote's docstring, not a new one.
+    """
+    if indeterminate:
+        return EXIT_INDETERMINATE
+    if interrupted:
+        return EXIT_INTERRUPTED
+    return exit_code_for_remote(exit_code)

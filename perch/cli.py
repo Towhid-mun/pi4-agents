@@ -143,8 +143,12 @@ def _dispatch(args: argparse.Namespace) -> int:
     # 5 Execute.
     result = executor.run(cfg, command, session)
 
-    # 7 Settle. Phase 0/1 settle by propagating the status and nothing else.
-    return errors.exit_code_for_remote(result.exit_code)
+    # 7 Settle. Phase 0/1 settled by propagating the status alone; P2 adds
+    # the interrupted/indeterminate outcomes C4 can now report (I7's exit
+    # 130 must be confirmed-dead, never assumed - see executor.run()).
+    return errors.exit_code_for_run(
+        result.exit_code, interrupted=result.interrupted, indeterminate=result.indeterminate
+    )
 
 
 def _command_for(cfg: config.Config, args: argparse.Namespace) -> str:
