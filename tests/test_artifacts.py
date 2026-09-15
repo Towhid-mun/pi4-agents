@@ -60,8 +60,8 @@ class TestDefaultDest(unittest.TestCase):
     def test_dot_perch_is_already_a_builtin_exclude(self):
         # The whole P4-2.3 round-trip answer depends on this being true -
         # see the module docstring. If this ever fails, the default
-        # destination is no longer round-trip-safe and the reasoning in
-        # docs/PHASE-4-BUILD-AND-RUN.md needs revisiting, not just this test.
+        # destination is no longer round-trip-safe - the reasoning behind
+        # it needs revisiting, not just this test.
         self.assertIn(".perch/", BUILTIN_EXCLUDES)
 
 

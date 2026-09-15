@@ -221,17 +221,14 @@ def _refuse_if_running_on_the_target() -> None:
     from this one obvious cause, not a clean error - so it is checked and
     refused here, before config resolution or any network activity,
     rather than left to surface however the connection attempt happens to
-    fail. See docs/PHASE-5-BUILD-AND-RUN.md for what the confusing
-    failure actually looks like when this check is bypassed (e.g. by
-    running perch on some other non-macOS host on purpose).
+    fail.
     """
     if platform.system() != "Darwin":
         raise errors.ConfigError(
             f"this looks like {platform.system()} ({platform.machine()}), "
             "not macOS - perch must run on the HOST, never the target. If "
             "this is a VS Code window connected to the Pi over Remote-SSH, "
-            "close it and reopen the project as a plain LOCAL window (see "
-            "docs/PHASE-5-BUILD-AND-RUN.md)."
+            "close it and reopen the project as a plain LOCAL window."
         )
 
 
@@ -381,9 +378,9 @@ def _command_for(cfg: config.Config, args: argparse.Namespace) -> str:
 # --------------------------------------------------------------------------
 
 _TASKS_JSON_TEMPLATE = """\
-// perch's editor integration (P5-1 / C8). Thin: these tasks call the perch
-// CLI and nothing else. See docs/PHASE-5-BUILD-AND-RUN.md for how the
-// problem matcher below was derived and verified against real output.
+// perch's editor integration. Thin: these tasks call the perch CLI and
+// nothing else. The problem matcher below was derived and verified
+// against real output.
 //
 // *** DO NOT open this project with VS Code Remote-SSH connected to the target. ***
 // These tasks assume they are running on the HOST. If the window is
@@ -521,8 +518,8 @@ def _choose_ssh_alias() -> str:
     if not aliases:
         raise errors.ConfigError(
             "no ssh alias given, and none found in ~/.ssh/config to choose "
-            "from. Add a Host entry there (see docs/PHASE-5-BUILD-AND-RUN.md), "
-            "or run `perch init <alias>` directly."
+            "from. Add a Host entry there, or run `perch init <alias>` "
+            "directly."
         )
     if not sys.stdin.isatty():
         raise errors.ConfigError(

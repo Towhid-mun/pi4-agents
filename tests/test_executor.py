@@ -1,10 +1,8 @@
 """C4 remote execution. Offline for the pure pieces.
 
-Per DEVELOPMENT-PLAN.md's test strategy table, C4 execution itself is
-integration-level (needs a reachable target) - the actual streaming behavior
-is verified live against the real Pi, with a timestamped transcript in
-docs/PHASE-2-BUILD-AND-RUN.md. What's testable with no network is the pure
-command-string building.
+C4 execution itself is integration-level (needs a reachable target) - the
+actual streaming behavior is verified live against the real Pi separately.
+What's testable with no network is the pure command-string building.
 """
 
 import shlex

@@ -4,9 +4,8 @@ Makes the target tree identical to the host tree for included paths. One
 direction only: the host workspace is the sole source of truth and the target's
 copy is derived and disposable (I2).
 
-P4-4 - the sync fast path. See content_hash()/push() below and
-docs/PHASE-4-BUILD-AND-RUN.md's "Design decisions" section for the full
-reasoning. Short version: when the local tree's content hash matches the
+P4-4 - the sync fast path. See content_hash()/push() below. Short
+version: when the local tree's content hash matches the
 hash recorded after the last successful real sync, push() considers
 skipping the (expensive, full-content-checksum) rsync transfer - but first
 confirms, with ONE cheap stat-only remote listing (no content read, no
@@ -210,8 +209,8 @@ def _run(argv: list[str], *, quiet: bool = False) -> subprocess.CompletedProcess
 # trusted, and reusing mtime here would reopen exactly that hole from a new
 # angle. A same-size, different-content edit made directly on the target
 # would slip past signal 2 (a real gap, documented, not solved by this
-# design - --force-sync is the escape hatch); every edit gate-tested here
-# in practice (see docs/PHASE-4-BUILD-AND-RUN.md) changes size.
+# design - --force-sync is the escape hatch); every edit tested against
+# the real target in practice changes size.
 #
 # The exclude match in both signals is deliberately NOT a full
 # reimplementation of rsync's pattern language - only the two shapes every

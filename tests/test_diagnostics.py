@@ -305,7 +305,7 @@ class TestPathResolver(unittest.TestCase):
         self.assertIsNone(self.resolver.resolve("/usr/include/stdio.h"))
 
     def test_make_dash_c_subdir_shifts_relative_resolution(self):
-        # The exact trap DEVELOPMENT-PLAN.md names, and the exact line GNU
+        # The `make -C subdir` cwd-tracking trap, using the exact line GNU
         # Make 4.4.1 really printed (make_subdir.stdout.txt).
         self.resolver.observe("make: Entering directory '/home/towhid/perch-diag-capture/subdir'")
         self.assertEqual(
@@ -376,8 +376,8 @@ class TestRewriteLine(unittest.TestCase):
         # runs the recipe, whose failure is what produces the gcc error
         # (stderr) - "Leaving directory" (stdout) is announced only AFTER
         # the recipe finishes, so at the moment the error is resolved, the
-        # resolver must still believe it is inside subdir. This is the trap
-        # DEVELOPMENT-PLAN.md names, replayed against the real capture.
+        # resolver must still believe it is inside subdir - replayed
+        # against the real capture.
         resolver = PathResolver(self.local_root, "perch-diag-capture")
         entering = next(l for l in lines_of("make_subdir.stdout.txt") if "Entering directory" in l)
         resolver.observe(strip_ansi(entering))

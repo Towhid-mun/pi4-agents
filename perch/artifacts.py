@@ -10,11 +10,11 @@ glob and the default destination behave identically in both places by
 construction, not by two separately-maintained implementations (P4-2 traps
 2 and 3).
 
-P4-2.3 - the round trip (see docs/PHASE-4-BUILD-AND-RUN.md for the full
-reasoning): a file pulled into the host workspace is now something the NEXT
-sync will push right back to the target, at best wastefully and at worst
-overwriting a fresher target-side build with a now-stale host copy - the
-same failure class I3 exists to prevent, from the opposite direction.
+P4-2.3 - the round trip: a file pulled into the host workspace is now
+something the NEXT sync will push right back to the target, at best
+wastefully and at worst overwriting a fresher target-side build with a
+now-stale host copy - the same failure class I3 exists to prevent, from
+the opposite direction.
 DEFAULT_DEST_SUBDIR sidesteps this for the common case rather than merely
 documenting it: it is `.perch/`-rooted, which config.BUILTIN_EXCLUDES
 already protects unconditionally (added this phase for the run lock) - so

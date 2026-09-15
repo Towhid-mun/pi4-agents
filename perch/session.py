@@ -3,9 +3,8 @@
 Every ssh invocation in the codebase goes through this module. Nothing else
 may build an argv naming "ssh" as the program - route it through a Session.
 
-See docs/PHASE-1-BUILD-AND-RUN.md for why the numbers below (ConnectTimeout,
-ControlPersist, retry count) are what they are; that document owns the
-rationale so it doesn't drift out of sync with a second copy here.
+The numbers below (ConnectTimeout, ControlPersist, retry count) were each
+chosen empirically against the real target, not guessed.
 """
 
 import hashlib
@@ -48,8 +47,7 @@ class Classification:
 
 
 # Each ssh-level failure ssh can report on stderr, before the remote shell
-# ever ran - so there is no ambiguity here with a remote command's own output
-# (see docs/PHASE-1-BUILD-AND-RUN.md, "Classification").
+# ever ran - so there is no ambiguity here with a remote command's own output.
 _PATTERNS: tuple[tuple[tuple[str, ...], str, str, bool], ...] = (
     (
         ("Connection timed out", "Operation timed out", "Connection refused",

@@ -28,8 +28,7 @@ perch --version
 ## Quickstart
 
 1. Add an ssh alias for your target to `~/.ssh/config` (a literal
-   `HostName` is more reliable than mDNS - see
-   [docs/PHASE-1-BUILD-AND-RUN.md](docs/PHASE-1-BUILD-AND-RUN.md)):
+   `HostName` is more reliable than mDNS):
 
    ```
    Host pi
@@ -64,9 +63,7 @@ perch --version
 <!--
   Hand-written transcript, not an actual asciinema recording (asciinema
   wasn't available when this was written) - but every line below is real,
-  verified output from this exact sequence run against a live Raspberry Pi
-  (see docs/PHASE-0-BUILD-AND-RUN.md and docs/PHASE-5-BUILD-AND-RUN.md for
-  the full, dated transcripts this is drawn from).
+  verified output from this exact sequence run against a live Raspberry Pi.
 -->
 
 ```
@@ -103,11 +100,4 @@ line 4, column 40.
 - [`architecture/ARCHITECTURE.md`](architecture/ARCHITECTURE.md) - the
   authoritative contract: invariants, components, the exit-code contract,
   the failure matrix.
-- [`architecture/DEVELOPMENT-PLAN.md`](architecture/DEVELOPMENT-PLAN.md) -
-  how it was built, phase by phase, and why.
-- `docs/PHASE-0` through `docs/PHASE-5-BUILD-AND-RUN.md` - a from-scratch
-  setup guide (Phase 0) plus what each later phase actually verified live
-  against the target, including known gaps and troubleshooting tables.
-- [`docs/PROJECT-BRIEF.md`](docs/PROJECT-BRIEF.md) - the original brief
-  that motivated the project, kept as historical record.
 - `CLAUDE.md` - the whole agent contract, in five lines.

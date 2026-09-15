@@ -1,15 +1,14 @@
-// perch's editor integration (P5-1 / C8). Thin: these tasks call the perch
-// CLI and nothing else. See docs/PHASE-5-BUILD-AND-RUN.md for how the
-// problem matcher below was derived and verified against real output.
+// perch's editor integration. Thin: these tasks call the perch CLI and
+// nothing else. The problem matcher below was derived and verified
+// against real output.
 //
 // *** DO NOT open this project with VS Code Remote-SSH connected to the Pi. ***
 // These tasks assume they are running on the HOST (your Mac). If the window
 // is attached to the Pi over Remote-SSH, the task's shell runs ON THE PI, so
 // `perch` (which itself shells out to `ssh <alias>`) would try to SSH from
-// the Pi to itself. It will not fail cleanly - see
-// docs/PHASE-5-BUILD-AND-RUN.md for exactly what that looks like. Open this
-// project in a plain LOCAL VS Code window (bottom-left corner should read
-// nothing, or your Mac's hostname - never "SSH: pi").
+// the Pi to itself. It will not fail cleanly. Open this project in a plain
+// LOCAL VS Code window (bottom-left corner should read nothing, or your
+// Mac's hostname - never "SSH: pi").
 {
   "version": "2.0.0",
   "tasks": [
@@ -21,7 +20,7 @@
       "group": { "kind": "build", "isDefault": true },
       "presentation": { "reveal": "always", "panel": "shared", "clear": true },
       "problemMatcher": {
-        // Verified against real output (docs/PHASE-5-BUILD-AND-RUN.md):
+        // Verified against real output:
         // C5 (perch/diagnostics.py) rewrites a diagnostic's file field to an
         // ABSOLUTE local path before this ever reaches the terminal, so
         // fileLocation is "absolute" - NOT ["relative", "${workspaceFolder}"].

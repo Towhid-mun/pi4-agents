@@ -48,10 +48,9 @@ Host pi
 
 Use a **literal IP address**, not the target's `.local` mDNS name, for
 `HostName`. mDNS resolution turned out to be unreliable on the network
-this tool was actually developed on (see
-[`docs/PROJECT-BRIEF.md`](PROJECT-BRIEF.md)'s constraints section) - a
-literal address sidesteps that failure mode entirely. Find the target's
-IP with `hostname -I` run on the target itself, or check your router.
+this tool was actually developed on - a literal address sidesteps that
+failure mode entirely. Find the target's IP with `hostname -I` run on the
+target itself, or check your router.
 
 You don't strictly need a `~/.ssh/config` entry at all: if your local
 username matches your account on the target and the default port/key
@@ -458,22 +457,24 @@ perch pull  <glob> [dest]
 | `--force-sync` | `sync`/`build`/`test`/`run`/`exec` | Forces a real rsync even if perch thinks nothing changed. Use this if you suspect the target has drifted out of band (e.g. you edited something over a direct `ssh` session) - perch's own change-detection can't see that. |
 | `--force` | `init` only | Overwrites `.perch.toml` / `.vscode/tasks.json` / `CLAUDE.md` if they already exist. |
 
-## 9. Editor and agent integration (brief - see the linked docs for the full story)
+## 9. Editor and agent integration (brief)
 
 - **VS Code:** `.vscode/tasks.json` (written by `perch init`) gives you
   build/test/run/doctor tasks with `Cmd+Shift+B` mapped to build, and
   compiler errors clickable straight from the Problems panel.
   **Never open the project through Remote-SSH connected to the
-  target** - see [`docs/PHASE-5-BUILD-AND-RUN.md`](PHASE-5-BUILD-AND-RUN.md)
-  for exactly why that breaks and how perch protects against it.
+  target** - the task's shell would then run ON the target, so `perch`
+  (which itself shells out to `ssh <alias>`) would try to SSH from the
+  target to itself. `perch` also refuses to run at all on a non-macOS
+  host as a safety net against exactly this.
 - **Claude Code / an agent:** `CLAUDE.md` (also written by `perch init`)
   tells an agent to build/test/run only through perch, never locally.
   If you're working *on* this repo itself rather than a project that
   merely *uses* perch, this repository's own `.claude/settings.json`
   pre-approves perch's ordinary verbs so an agent loop doesn't stop for
-  permission prompts on every build - see
-  [`docs/PHASE-5-BUILD-AND-RUN.md`](PHASE-5-BUILD-AND-RUN.md) for the
-  exact rules and why `perch exec` is deliberately left out of that list.
+  permission prompts on every build - `perch exec` is deliberately left
+  out of that list, since it runs an arbitrary command on the target and
+  there's no safe way to allow it except by always prompting.
 
 ## 10. Troubleshooting quick list
 
@@ -481,17 +482,15 @@ perch pull  <glob> [dest]
 |---|---|
 | `ssh pi true` hangs or asks for a password | Fix this before anything perch-related - see §1.3 |
 | `perch: no .perch.toml found...` | You're not inside a directory `perch init` (or a hand-written `.perch.toml`) ran in - it's found by walking up from your current directory |
-| A build error's path isn't clickable / doesn't `ls` | See `docs/PHASE-5-BUILD-AND-RUN.md`'s troubleshooting table - usually a compiler output shape the diagnostic mapper doesn't recognize yet |
+| A build error's path isn't clickable / doesn't `ls` | Usually a compiler output shape the diagnostic mapper doesn't recognize yet |
 | `perch run` can't find a binary a previous `perch build` made | §5 above - rebuild inside `run` itself |
 | A build/test/run exits 75 | Another invocation (maybe from a different machine) holds the run lock - the message names its process group; `--replace` if you're sure it shouldn't be there |
 | `perch build` seems to run against stale content | It printed "sync skipped" - re-run with `--force-sync`, especially if you edited something directly on the target over a separate `ssh` session |
 | An `artifacts` entry sometimes fails the whole command | Use a real glob, not a bare filename - see §7.1 |
-| `perch` refuses immediately, saying "not macOS" | You're running it on the target itself, most likely a VS Code Remote-SSH window - see `docs/PHASE-5-BUILD-AND-RUN.md` |
+| `perch` refuses immediately, saying "not macOS" | You're running it on the target itself, most likely a VS Code Remote-SSH window |
 
 ## Where to go next
 
 - [`README.md`](../README.md) - the short version, if you skipped it.
 - [`architecture/ARCHITECTURE.md`](../architecture/ARCHITECTURE.md) - the
   full contract: invariants, exit codes, the failure matrix.
-- `docs/PHASE-0` through `docs/PHASE-5-BUILD-AND-RUN.md` - what was
-  verified live at each stage, plus deeper troubleshooting tables.

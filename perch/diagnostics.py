@@ -48,8 +48,8 @@ class Diagnostic:
     `In file included from` chain line) - the caller decides what counts as
     an emittable diagnostic (P3-3): only "error" and "warning" do. A "note"
     is recognized (so its path can still be rewritten for a human to click)
-    but, per DEVELOPMENT-PLAN.md P3-1, is not a NEW diagnostic - it belongs
-    to the error that preceded it, and gets no event of its own.
+    but is not a NEW diagnostic - it belongs to the error that preceded
+    it, and gets no event of its own.
     """
 
     file: str
@@ -158,8 +158,8 @@ def parse_line(line: str) -> Diagnostic | None:
 def is_event(diagnostic: Diagnostic) -> bool:
     """True for the diagnostics that get their own event (P3-3): a primary
     error or warning. A note is recognized (P3-1) so its path can still be
-    rewritten (P3-2), but per DEVELOPMENT-PLAN.md it is not a NEW diagnostic;
-    an include-chain line has no severity at all - it is pure context.
+    rewritten (P3-2), but it is not a NEW diagnostic; an include-chain
+    line has no severity at all - it is pure context.
     """
     return diagnostic.severity in ("error", "warning")
 

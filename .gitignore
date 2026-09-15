@@ -6,3 +6,12 @@ build/
 dist/
 .DS_Store
 .perch/
+docs/PHASE-0-BUILD-AND-RUN.md
+docs/PHASE-1-BUILD-AND-RUN.md
+docs/PHASE-2-BUILD-AND-RUN.md
+docs/PHASE-3-BUILD-AND-RUN.md
+docs/PHASE-4-BUILD-AND-RUN.md
+docs/PHASE-5-BUILD-AND-RUN.md
+docs/PROJECT-BRIEF.md
+architecture/DEVELOPMENT-PLAN.md
+

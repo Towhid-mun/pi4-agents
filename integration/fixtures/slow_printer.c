@@ -1,6 +1,6 @@
 /* Prints once per second, N times, WITHOUT an explicit fflush - the "gcc,
- * make and python detect a pipe and switch to block buffering" case from
- * DEVELOPMENT-PLAN.md P2-1 (trap 4). glibc fully-buffers stdout by default
+ * make and python detect a pipe and switch to block buffering" case
+ * (P2-1, trap 4). glibc fully-buffers stdout by default
  * when it is not a tty, so run directly (no stdbuf) all output arrives in
  * one lump at exit; run through perch (which wraps with `stdbuf -oL -eL`
  * when available - ADR-5) it streams one line per second like ticker.sh.

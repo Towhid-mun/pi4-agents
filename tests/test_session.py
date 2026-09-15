@@ -1,7 +1,7 @@
 """C2 session manager. Offline throughout - subprocess.run is monkeypatched
 wherever a real ssh invocation would otherwise happen, so nothing here reaches
 the network. The done-tests that actually exercise a live control master
-against the real Pi are documented in docs/PHASE-1-BUILD-AND-RUN.md.
+were verified against the real Pi separately.
 """
 
 import unittest
