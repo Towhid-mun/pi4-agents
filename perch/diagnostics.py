@@ -1,10 +1,12 @@
 """C5 - diagnostic mapper: parse the live stream, rewrite paths, and pass
 everything else through byte-identical (I8).
 
-This ticket (P3-1) is parsing only: recognize gcc/clang, linker and Python
-traceback lines and extract their fields. Path rewriting (using the
-(local_root, remote_root) pair C1 derives - this module does not derive it)
-is P3-2; the structured --json event stream is P3-3.
+P3-1 (parsing) recognizes gcc/clang, linker and Python traceback lines and
+extracts their fields. P3-2 (this module too - C5 is one module, per
+ARCHITECTURE.md §4) adds path rewriting: turning the FILE a diagnostic names
+into a local, `ls`-able path, using the (local_root, remote_root) pair C1
+derives - this module never derives that pair itself, only consumes it. The
+structured --json event stream is P3-3.
 
 The fixture corpus this module is written against (P3-4,
 tests/fixtures/*.stderr.txt, captured for real from the target - see
@@ -20,6 +22,7 @@ above each pattern for the false-positive it was checked against.
 
 import re
 from dataclasses import dataclass
+from pathlib import Path
 
 # Matches the SGR/CSI escape sequences gcc emits under
 # -fdiagnostics-color=always (confirmed by raw byte capture -
@@ -54,6 +57,13 @@ class Diagnostic:
     col: int | None
     severity: str | None  # "error" | "warning" | "note" | None
     message: str | None
+    file_span: tuple[int, int]  # (start, end) of `file` within the CLEANED line -
+    # P3-2 rewrites by slicing the original line at this exact span and
+    # splicing in the resolved local path, rather than reconstructing the
+    # whole line from its parsed pieces. A rebuild-from-parts risks silently
+    # getting some OTHER piece of the line wrong (spacing, punctuation) even
+    # when the file/line/col/severity/message themselves are all correct;
+    # a span-based splice touches nothing but the file text itself.
 
 
 # gcc/clang primary form: path:line:col: severity: message
@@ -108,12 +118,14 @@ def parse_line(line: str) -> Diagnostic | None:
             col=int(m.group("col")),
             severity=m.group("severity"),
             message=m.group("message"),
+            file_span=m.span("file"),
         )
 
     m = _LINKER_RE.match(clean)
     if m:
         return Diagnostic(
-            file=m.group("file"), line=None, col=None, severity="error", message=m.group("message")
+            file=m.group("file"), line=None, col=None, severity="error", message=m.group("message"),
+            file_span=m.span("file"),
         )
 
     m = _PYTHON_RE.match(clean)
@@ -125,6 +137,7 @@ def parse_line(line: str) -> Diagnostic | None:
             col=None,
             severity="error",
             message=(f"in {func}" if func else ""),
+            file_span=m.span("file"),
         )
 
     m = _INCLUDE_RE.match(clean)
@@ -136,6 +149,7 @@ def parse_line(line: str) -> Diagnostic | None:
             col=(int(col) if col else None),
             severity=None,
             message=None,
+            file_span=m.span("file"),
         )
 
     return None
@@ -148,3 +162,98 @@ def is_event(diagnostic: Diagnostic) -> bool:
     an include-chain line has no severity at all - it is pure context.
     """
     return diagnostic.severity in ("error", "warning")
+
+
+# --------------------------------------------------------------------------
+# P3-2: path rewriting.
+# --------------------------------------------------------------------------
+
+# GNU Make 4.4.1's own directory announcements under -C, confirmed to appear
+# by default (no flag needed) on STDOUT - tests/fixtures/make_subdir.stdout.txt.
+# "make[N]:" (a bracketed sub-make level) is handled defensively even though
+# this target's single-level `-C` capture never produced one - a well-known,
+# standard GNU Make behavior for RECURSIVE sub-makes, cheap to accept and
+# safe: it only ever narrows which lines match, never widens it, since it is
+# still anchored to the exact "Entering/Leaving directory '...'" text.
+_ENTERING_RE = re.compile(r"^make(?:\[\d+\])?: Entering directory '(?P<dir>.+)'$")
+_LEAVING_RE = re.compile(r"^make(?:\[\d+\])?: Leaving directory '(?P<dir>.+)'$")
+
+
+class PathResolver:
+    """Tracks the compiler's actual remote working directory across a run
+    (P3-2's `make -C subdir` trap) and turns a diagnostic's raw file field
+    into a local, `ls`-able path.
+
+    Owns none of (local_root, remote_root) itself - both come from C1's
+    Config, passed in once at construction. Never derives the pair; only
+    consumes it (ARCHITECTURE.md: C1 is the only place it is derived).
+    """
+
+    def __init__(self, local_root: Path, remote_root: str):
+        self.local_root = local_root
+        self.remote_root = remote_root.rstrip("/")
+        # A stack of directories relative to remote_root ("" == remote_root
+        # itself), because Entering/Leaving is inherently LIFO - nested
+        # `make -C` must pop back to the INTERMEDIATE level, not straight to
+        # remote_root, even though only one level has been seen for real.
+        self._cwd_stack: list[str] = [""]
+
+    def observe(self, clean_line: str) -> None:
+        """Watch one already-ANSI-stripped line for a directory change.
+        Never raises, never rewrites the line - purely internal bookkeeping.
+        """
+        m = _ENTERING_RE.match(clean_line)
+        if m:
+            rel = self._workspace_relative(m.group("dir"))
+            self._cwd_stack.append(rel if rel is not None else self._cwd_stack[-1])
+            return
+        m = _LEAVING_RE.match(clean_line)
+        if m and len(self._cwd_stack) > 1:
+            self._cwd_stack.pop()
+
+    def _workspace_relative(self, path: str) -> str | None:
+        """`path` (absolute or relative) as a path relative to remote_root,
+        or None if it is not recognizably inside the workspace at all - a
+        system path, a scratch file in /tmp, anything C3 never mirrored.
+        """
+        if path.startswith("/"):
+            # remote_root may itself be absolute (an explicit config choice,
+            # ARCHITECTURE.md/C1) or relative-to-$HOME (the common case) -
+            # normalize to a single leading slash either way, or this
+            # doubles up ("//srv/blinky/") and never matches anything.
+            root_component = self.remote_root if self.remote_root.startswith("/") else f"/{self.remote_root}"
+            needle = f"{root_component}/"
+            idx = path.find(needle)
+            if idx == -1:
+                if path.rstrip("/") == root_component:
+                    return ""
+                return None
+            return path[idx + len(needle):]
+        # Relative: resolve against the compiler's CURRENT remote cwd, not
+        # remote_root directly - this is the make -C subdir trap. gcc inside
+        # `make -C subdir` names only "sub_error.c", relative to subdir.
+        cwd = self._cwd_stack[-1]
+        return f"{cwd}/{path}" if cwd else path
+
+    def resolve(self, file: str) -> str | None:
+        """The local, absolute, `ls`-able path for a diagnostic's raw file
+        field, or None if it is not recognizably a workspace file (a system
+        header, a /tmp object file) - callers must leave those untouched.
+        """
+        relative = self._workspace_relative(file)
+        if relative is None:
+            return None
+        return str(self.local_root / relative)
+
+
+def rewrite_line(line: str, diagnostic: Diagnostic, resolver: PathResolver) -> str:
+    """Splice the resolved local path into `line` at the diagnostic's own
+    file_span - see Diagnostic.file_span for why a splice, not a rebuild.
+    Returns `line` completely unchanged if the file cannot be resolved
+    (outside the workspace) - never fabricates a path.
+    """
+    local = resolver.resolve(diagnostic.file)
+    if local is None:
+        return line
+    start, end = diagnostic.file_span
+    return line[:start] + local + line[end:]

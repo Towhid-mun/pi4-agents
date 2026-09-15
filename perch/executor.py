@@ -293,6 +293,7 @@ def _run_pipes(cfg: Config, command: str, session: Session) -> RunResult:
     survives on purpose), reap it first (P2-4).
     """
     reap_stale_group(cfg, session)
+    resolver = diagnostics.PathResolver(cfg.local_root, cfg.remote_root)
 
     token = new_marker_token()
     proc = session.popen(build_wrapped_command(cfg.remote_root, command, token))
@@ -321,6 +322,19 @@ def _run_pipes(cfg: Config, command: str, session: Session) -> RunResult:
     outcome = "normal"  # normal | interrupted_confirmed | interrupted_unconfirmed
     broken = {"stdout": False, "stderr": False}  # our OWN downstream consumer went away
 
+    def for_display(line: str) -> str:
+        """C5: strip ANSI, track the compiler's remote cwd (P3-2's
+        `make -C subdir` trap), and rewrite a recognized diagnostic's path
+        to a local one. A line that is not a diagnostic - the overwhelming
+        common case - comes back with nothing touched but the ANSI strip.
+        """
+        clean = diagnostics.strip_ansi(line)
+        resolver.observe(clean)
+        diag = diagnostics.parse_line(clean)
+        if diag is None:
+            return clean
+        return diagnostics.rewrite_line(clean, diag, resolver)
+
     def emit(stream: str, line: str, *, had_newline: bool = True) -> None:
         # Trap 3: our own stdout/stderr are block-buffered when not a
         # terminal. Flush every line explicitly.
@@ -328,16 +342,11 @@ def _run_pipes(cfg: Config, command: str, session: Session) -> RunResult:
             return
         out = sys.stdout if stream == "stdout" else sys.stderr
         try:
-            # C5/P3-1: strip ANSI before the user ever sees it. Colour codes
-            # forced via -fdiagnostics-color=always are pointless noise once
-            # captured into a non-terminal pipe (they defeat the diagnostic
-            # regex too, which is the other reason this has to happen before
-            # anything else looks at the line). had_newline=False for a
-            # genuine final unterminated line (I8: fabricating a trailing
-            # newline the source never had is still corrupting the output,
-            # just subtly - caught live against the noise fixture, whose
-            # last line deliberately has none).
-            out.write(diagnostics.strip_ansi(line) + ("\n" if had_newline else ""))
+            # had_newline=False for a genuine final unterminated line (I8:
+            # fabricating a trailing newline the source never had is still
+            # corrupting the output, just subtly - caught live against the
+            # noise fixture, whose last line deliberately has none).
+            out.write(for_display(line) + ("\n" if had_newline else ""))
             out.flush()
         except BrokenPipeError:
             # Our own local consumer (e.g. `perch build | head`) went away.

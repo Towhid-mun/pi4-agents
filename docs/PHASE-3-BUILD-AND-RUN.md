@@ -61,11 +61,21 @@ human sees too, per gate item 1, which does not mention `--json`.
 **(chosen here, pending P3-1's real fixtures)** — placeholders below are
 filled in as each ticket lands; this section is the running record.
 
-- **Rewritten path form**: TBD at P3-2 - candidates are an absolute local
-  path (unambiguous regardless of the caller's cwd, guarantees gate item 1's
-  `ls` check trivially) vs. a path relative to the caller's own cwd (matches
-  what a local compiler invocation would print, but needs an extra piece of
-  context C1 does not currently provide). Decided in the P3-2 commit.
+- **Rewritten path form (decided, P3-2)**: always an absolute local path
+  (`local_root / workspace-relative-part`), never relative to the caller's
+  own cwd. Unambiguous regardless of where `perch build` was actually run
+  from, needs no extra context beyond what C1 already provides, and makes
+  gate item 1's `ls` check trivially true by construction. Verified live,
+  not just offline: a real `make -C subdir` failure prints
+  `/Volumes/.../diag-sources/subdir/sub_error.c:4:20: error: ...` and `ls`
+  on that exact string succeeds.
+- **Resolution mechanism**: a diagnostic's raw file text is spliced out of
+  the line at its exact regex match span and replaced - never a
+  reconstruct-the-whole-line-from-parsed-parts, which risks silently getting
+  some OTHER piece (spacing, punctuation) wrong even when file/line/col
+  themselves are correct. A file that cannot be placed inside the workspace
+  (a system header, a `/tmp/ccXXXXXX.o` linker scratch file) is left
+  completely untouched, never given a fabricated local path.
 - **ANSI escape sequences (decided, P3-1)**: stripped, both for matching AND
   for what the user sees - never kept. `-fdiagnostics-color=always` produces
   real escapes sitting directly before the filename (confirmed by raw byte

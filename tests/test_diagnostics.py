@@ -7,7 +7,7 @@ import unittest
 from pathlib import Path
 
 from perch import diagnostics
-from perch.diagnostics import Diagnostic, is_event, parse_line, strip_ansi
+from perch.diagnostics import Diagnostic, PathResolver, is_event, parse_line, rewrite_line, strip_ansi
 
 FIXTURES = Path(__file__).parent / "fixtures"
 
@@ -67,14 +67,17 @@ class TestCleanBuildHasNothingToParse(unittest.TestCase):
 
 class TestGccSingleError(unittest.TestCase):
     def test_the_primary_line_parses(self):
-        diag = parse_line("single_error.c:5:22: error: expected ‘;’ before ‘return’")
+        line = "single_error.c:5:22: error: expected ‘;’ before ‘return’"
+        diag = parse_line(line)
         self.assertEqual(
             diag,
             Diagnostic(
                 file="single_error.c", line=5, col=22, severity="error",
                 message="expected ‘;’ before ‘return’",
+                file_span=(0, len("single_error.c")),
             ),
         )
+        self.assertEqual(line[diag.file_span[0]:diag.file_span[1]], "single_error.c")
         self.assertTrue(is_event(diag))
 
     def test_the_no_line_col_context_line_is_not_recognized(self):
@@ -266,9 +269,133 @@ class TestEncodingSafety(unittest.TestCase):
 
 class TestDiagnosticIsFrozenEnoughToCompare(unittest.TestCase):
     def test_equal_fields_compare_equal(self):
-        a = diagnostics.Diagnostic(file="x.c", line=1, col=2, severity="error", message="m")
-        b = diagnostics.Diagnostic(file="x.c", line=1, col=2, severity="error", message="m")
+        a = diagnostics.Diagnostic(
+            file="x.c", line=1, col=2, severity="error", message="m", file_span=(0, 3)
+        )
+        b = diagnostics.Diagnostic(
+            file="x.c", line=1, col=2, severity="error", message="m", file_span=(0, 3)
+        )
         self.assertEqual(a, b)
+
+
+class TestPathResolver(unittest.TestCase):
+    def setUp(self):
+        self.local_root = Path("/Users/towhid/work/blinky")
+        self.resolver = PathResolver(self.local_root, "perch-diag-capture")
+
+    def test_relative_path_resolves_against_remote_root(self):
+        self.assertEqual(
+            self.resolver.resolve("single_error.c"),
+            str(self.local_root / "single_error.c"),
+        )
+
+    def test_absolute_path_under_remote_root_resolves(self):
+        # Real shape from traceback.stderr.txt.
+        self.assertEqual(
+            self.resolver.resolve("/home/towhid/perch-diag-capture/traceback.py"),
+            str(self.local_root / "traceback.py"),
+        )
+
+    def test_absolute_path_outside_the_workspace_is_left_unresolved(self):
+        # Real shapes from linker_error.stderr.txt - a scratch object file
+        # and (hypothetically) a system header. Neither was ever mirrored;
+        # fabricating a local path for either would be worse than leaving
+        # the line untouched.
+        self.assertIsNone(self.resolver.resolve("/tmp/ccIlWxtk.o"))
+        self.assertIsNone(self.resolver.resolve("/usr/include/stdio.h"))
+
+    def test_make_dash_c_subdir_shifts_relative_resolution(self):
+        # The exact trap DEVELOPMENT-PLAN.md names, and the exact line GNU
+        # Make 4.4.1 really printed (make_subdir.stdout.txt).
+        self.resolver.observe("make: Entering directory '/home/towhid/perch-diag-capture/subdir'")
+        self.assertEqual(
+            self.resolver.resolve("sub_error.c"),
+            str(self.local_root / "subdir" / "sub_error.c"),
+        )
+
+    def test_leaving_directory_restores_the_previous_level(self):
+        self.resolver.observe("make: Entering directory '/home/towhid/perch-diag-capture/subdir'")
+        self.resolver.observe("make: Leaving directory '/home/towhid/perch-diag-capture/subdir'")
+        self.assertEqual(self.resolver.resolve("single_error.c"), str(self.local_root / "single_error.c"))
+
+    def test_nested_entering_pops_in_lifo_order(self):
+        self.resolver.observe("make: Entering directory '/home/towhid/perch-diag-capture/a'")
+        self.resolver.observe("make: Entering directory '/home/towhid/perch-diag-capture/a/b'")
+        self.assertEqual(self.resolver.resolve("x.c"), str(self.local_root / "a" / "b" / "x.c"))
+        self.resolver.observe("make: Leaving directory '/home/towhid/perch-diag-capture/a/b'")
+        self.assertEqual(self.resolver.resolve("x.c"), str(self.local_root / "a" / "x.c"))
+        self.resolver.observe("make: Leaving directory '/home/towhid/perch-diag-capture/a'")
+        self.assertEqual(self.resolver.resolve("x.c"), str(self.local_root / "x.c"))
+
+    def test_an_unbalanced_leaving_does_not_underflow(self):
+        self.resolver.observe("make: Leaving directory '/home/towhid/perch-diag-capture'")  # no matching Entering
+        self.assertEqual(self.resolver.resolve("x.c"), str(self.local_root / "x.c"))  # must not raise
+
+    def test_bracketed_sub_make_level_is_still_recognized(self):
+        # Not observed on this target (single-level -C only) but standard,
+        # well-documented GNU Make behavior for recursive sub-makes - cheap
+        # and safe to accept since it only narrows the match, never widens it.
+        self.resolver.observe("make[1]: Entering directory '/home/towhid/perch-diag-capture/subdir'")
+        self.assertEqual(self.resolver.resolve("x.c"), str(self.local_root / "subdir" / "x.c"))
+
+    def test_entering_a_path_outside_the_workspace_does_not_crash_later_resolution(self):
+        self.resolver.observe("make: Entering directory '/some/other/place'")
+        # Falls back to whatever the cwd already was (remote_root itself),
+        # rather than adopting a bogus, unresolvable relative offset.
+        self.assertEqual(self.resolver.resolve("x.c"), str(self.local_root / "x.c"))
+
+    def test_absolute_remote_root_works_too(self):
+        resolver = PathResolver(self.local_root, "/srv/blinky")
+        self.assertEqual(resolver.resolve("/srv/blinky/src/main.c"), str(self.local_root / "src/main.c"))
+        self.assertIsNone(resolver.resolve("/tmp/x.o"))
+
+
+class TestRewriteLine(unittest.TestCase):
+    def setUp(self):
+        self.local_root = Path("/Users/towhid/work/blinky")
+        self.resolver = PathResolver(self.local_root, "perch-diag-capture")
+
+    def test_splices_only_the_file_span_leaving_everything_else_untouched(self):
+        line = "single_error.c:5:22: error: expected ‘;’ before ‘return’"
+        diag = parse_line(line)
+        rewritten = rewrite_line(line, diag, self.resolver)
+        self.assertEqual(
+            rewritten,
+            f"{self.local_root / 'single_error.c'}:5:22: error: expected ‘;’ before ‘return’",
+        )
+
+    def test_unresolvable_file_leaves_the_line_completely_unchanged(self):
+        # A system header - never part of the mirrored workspace.
+        line = "/usr/include/stdio.h:100:1: error: fake"
+        diag = parse_line(line)
+        self.assertEqual(rewrite_line(line, diag, self.resolver), line)
+
+    def test_real_make_subdir_fixture_end_to_end(self):
+        # Replays the ACTUAL captured lines in their real temporal order, not
+        # stream-by-stream: make prints "Entering directory" (stdout), THEN
+        # runs the recipe, whose failure is what produces the gcc error
+        # (stderr) - "Leaving directory" (stdout) is announced only AFTER
+        # the recipe finishes, so at the moment the error is resolved, the
+        # resolver must still believe it is inside subdir. This is the trap
+        # DEVELOPMENT-PLAN.md names, replayed against the real capture.
+        resolver = PathResolver(self.local_root, "perch-diag-capture")
+        entering = next(l for l in lines_of("make_subdir.stdout.txt") if "Entering directory" in l)
+        resolver.observe(strip_ansi(entering))
+        error_line = next(
+            l for l in lines_of("make_subdir.stderr.txt")
+            if ": error:" in l
+        )
+        diag = parse_line(error_line)
+        rewritten = rewrite_line(error_line, diag, resolver)
+        self.assertEqual(
+            rewritten,
+            f"{self.local_root / 'subdir' / 'sub_error.c'}:4:20: error: "
+            "‘missing_symbol’ undeclared (first use in this function)",
+        )
+        # ls-able: the rewritten path is absolute and points at a real
+        # location under local_root (gate item 1's actual check, done for
+        # real against the live workspace in the live verification pass).
+        self.assertTrue(Path(rewritten.split(":")[0]).is_absolute())
 
 
 if __name__ == "__main__":
