@@ -177,6 +177,33 @@ make: *** [Makefile:2: hello] Error 1
 ### exit status: 2
 ```
 
+**Stale as of Phase 3 (found re-running this document for the Phase 5
+cold-start test, fixed here rather than left to confuse a new reader):**
+that `src/main.c:4:40: ...` line is what Phase 0 actually produced, before
+C5 (the diagnostic mapper, Phase 3) existed. Re-running this exact
+sequence today, the same error now reads:
+
+```
+$ perch build
+gcc -Wall -o hello src/main.c
+src/main.c: In function ‘main’:
+/Users/towhid/perch-tryit/src/main.c:4:40: error: expected ‘;’ before ‘return’
+    4 |     printf("hello from %s\n", "the pi")
+      |                                        ^
+      |                                        ;
+    5 |     return 0;
+      |     ~~~~~~
+make: *** [Makefile:2: hello] Error 1
+exit: 2
+```
+
+An absolute, `ls`-able host path (`docs/PHASE-3-BUILD-AND-RUN.md` explains
+why) rather than the relative path gcc itself was given - a real behavior
+change, not a transcription error, and an improvement (this is what makes
+the path clickable in an editor - see `docs/PHASE-5-BUILD-AND-RUN.md`).
+The `make: *** [Makefile:2: hello] Error 1` line is unchanged either way -
+C5 deliberately never rewrites it (see P3-2's design decisions).
+
 The diagnostic is the Pi's own `gcc` (Debian 14.2.0), not the host's Clang —
 confirmed by contrast:
 
