@@ -124,13 +124,15 @@ def main(argv: list[str] | None = None) -> int:
         print(f"perch: {exc}", file=sys.stderr)
         return errors.exit_code_for(exc)
     except KeyboardInterrupt:
-        # Phase 0/1 are signal-naive by design (P2-3 owns this). We did not
-        # forward the interrupt and we have not confirmed that anything on the
-        # target is dead, so exiting 130 would be a lie about I7. The state of
-        # the run is genuinely unknown, which is what 74 means.
+        # A bare KeyboardInterrupt only reaches here from OUTSIDE a tracked
+        # remote command - during config resolution or the mirror step (3),
+        # before step 5 has captured any process group. executor.run()'s own
+        # signal handling (P2-3) covers the window where one exists; there is
+        # nothing here to confirm dead, so exiting 130 would be a lie about
+        # I7. The state is genuinely unknown, which is what 74 means.
         print(
-            "perch: interrupted. Whether the remote command is still running on "
-            "the target is unknown - signal forwarding arrives in P2-3.",
+            "perch: interrupted before a remote process group existed to "
+            "signal - state on the target is unknown.",
             file=sys.stderr,
         )
         return errors.exit_code_for(errors.IndeterminateRun())
