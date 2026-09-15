@@ -11,7 +11,7 @@ from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import dataclass
 from pathlib import Path
 
-from perch import cli, config, errors, executor, mirror
+from perch import artifacts, cli, config, errors, executor, mirror
 from perch.session import Session
 
 
@@ -37,6 +37,7 @@ class SequenceTestCase(unittest.TestCase):
         self.cfg = make_config()
         self.sync_error = None
         self.exit_code = 0
+        self.pull_results = {}  # glob -> list[str], default: matches nothing
 
         def load(start=None):
             self.calls.append(("resolve", None))
@@ -55,10 +56,15 @@ class SequenceTestCase(unittest.TestCase):
             self.last_replace = replace
             return executor.RunResult(exit_code=self.exit_code)
 
+        def pull(cfg, session, glob, dest=None):
+            self.calls.append(("pull", glob))
+            return self.pull_results.get(glob, [])
+
         for module, name, replacement in (
             (config, "load", load),
             (mirror, "push", push),
             (executor, "run", run),
+            (artifacts, "pull", pull),
         ):
             original = getattr(module, name)
             setattr(module, name, replacement)
@@ -191,6 +197,47 @@ class TestTtyAndJson(SequenceTestCase):
         self.invoke(["exec", "--tty", "true"])
         self.assertTrue(self.last_tty)
 
+    def test_replace_reaches_the_executor(self):
+        self.invoke(["build", "--replace"])
+        self.assertTrue(self.last_replace)
+
+    def test_replace_defaults_to_false(self):
+        self.invoke(["build"])
+        self.assertFalse(self.last_replace)
+
+
+class TestPullVerb(SequenceTestCase):
+    def test_pull_does_not_sync(self):
+        # Read-only, like doctor - no reason to require the workspace match
+        # first just to retrieve something already built.
+        self.pull_results = {"*.bin": ["build/out.bin"]}
+        self.invoke(["pull", "*.bin"])
+        self.assertNotIn("mirror", [step for step, _ in self.calls])
+
+    def test_pull_calls_artifacts_pull_with_the_glob(self):
+        self.invoke(["pull", "*.bin"])
+        self.assertIn(("pull", "*.bin"), self.calls)
+
+    def test_pull_reports_matches_on_stdout(self):
+        self.pull_results = {"*.bin": ["build/out.bin"]}
+        code, out, _ = self.invoke(["pull", "*.bin"])
+        self.assertEqual(code, 0)
+        self.assertIn("build/out.bin", out)
+
+    def test_pull_no_match_is_not_an_error(self):
+        code, out, _ = self.invoke(["pull", "*.bin"])
+        self.assertEqual(code, 0)
+        self.assertIn("no files matched", out)
+
+    def test_pull_propagates_a_pull_error(self):
+        def failing_pull(cfg, session, glob, dest=None):
+            raise errors.PullError("rsync exited 23")
+
+        artifacts.pull = failing_pull
+        code, _, err = self.invoke(["pull", "*.bin"])
+        self.assertEqual(code, errors.EXIT_INTERNAL)
+        self.assertIn("rsync exited 23", err)
+
 
 class TestSettleOutcomes(SequenceTestCase):
     """P2-6: the interrupted/indeterminate outcomes C4 can report must say
@@ -228,6 +275,79 @@ class TestSettleOutcomes(SequenceTestCase):
         self.assertNotIn("interrupted", err)
 
 
+class TestAutoPull(SequenceTestCase):
+    """P4-2/C6: config.artifacts auto-pulled after exit code 0 - and ONLY
+    then, ARCHITECTURE.md's own condition, not "the tool didn't error"."""
+
+    def test_no_artifacts_configured_means_no_pull(self):
+        self.cfg = make_config(artifacts=())
+        self.exit_code = 0
+        self.invoke(["build"])
+        self.assertNotIn("pull", [step for step, _ in self.calls])
+
+    def test_successful_build_pulls_every_configured_glob(self):
+        self.cfg = make_config(artifacts=("*.bin", "*.map"))
+        self.exit_code = 0
+        self.invoke(["build"])
+        self.assertEqual(
+            [glob for step, glob in self.calls if step == "pull"], ["*.bin", "*.map"]
+        )
+
+    def test_a_failed_remote_command_does_not_auto_pull(self):
+        # I6: exit_code here is the REMOTE command's own status - a nonzero
+        # one means the build failed, and ARCHITECTURE.md is explicit that
+        # auto-pull is conditioned on exit code 0.
+        self.cfg = make_config(artifacts=("*.bin",))
+        self.exit_code = 1
+        self.invoke(["build"])
+        self.assertNotIn("pull", [step for step, _ in self.calls])
+
+    def test_auto_pull_report_goes_to_stderr_not_stdout(self):
+        # --json's stdout must carry nothing but the event stream (P3-3) -
+        # auto-pull's own report must never land there, json mode or not.
+        self.cfg = make_config(artifacts=("*.bin",))
+        self.exit_code = 0
+        self.pull_results = {"*.bin": ["build/out.bin"]}
+        _, out, err = self.invoke(["build"])
+        self.assertNotIn("out.bin", out)
+        self.assertIn("out.bin", err)
+
+    def test_auto_pull_report_stays_off_stdout_in_json_mode_too(self):
+        self.cfg = make_config(artifacts=("*.bin",))
+        self.exit_code = 0
+        self.pull_results = {"*.bin": ["build/out.bin"]}
+        _, out, err = self.invoke(["build", "--json"])
+        self.assertNotIn("out.bin", out)
+        self.assertIn("out.bin", err)
+
+    def test_no_match_is_reported_but_not_fatal(self):
+        self.cfg = make_config(artifacts=("*.bin",))
+        self.exit_code = 0
+        code, _, err = self.invoke(["build"])
+        self.assertEqual(code, 0)
+        self.assertIn("no files matched", err)
+
+    def test_indeterminate_does_not_auto_pull(self):
+        def run(cfg, command, session, *, tty=False, json_mode=False, replace=False):
+            self.calls.append(("execute", command))
+            return executor.RunResult(exit_code=0, indeterminate=True)
+
+        executor.run = run
+        self.cfg = make_config(artifacts=("*.bin",))
+        self.invoke(["build"])
+        self.assertNotIn("pull", [step for step, _ in self.calls])
+
+    def test_interrupted_does_not_auto_pull(self):
+        def run(cfg, command, session, *, tty=False, json_mode=False, replace=False):
+            self.calls.append(("execute", command))
+            return executor.RunResult(exit_code=0, interrupted=True)
+
+        executor.run = run
+        self.cfg = make_config(artifacts=("*.bin",))
+        self.invoke(["build"])
+        self.assertNotIn("pull", [step for step, _ in self.calls])
+
+
 class TestArgumentSurface(unittest.TestCase):
     def test_usage_error_does_not_land_in_the_remote_failure_band(self):
         err = io.StringIO()
@@ -242,18 +362,18 @@ class TestArgumentSurface(unittest.TestCase):
             cli.main(["--help"])
         self.assertEqual(caught.exception.code, 0)
 
-    def test_every_phase_one_verb_is_present(self):
+    def test_every_verb_through_phase_four_is_present(self):
         parser = cli.build_parser()
         actions = [a for a in parser._actions if a.dest == "verb"]
         self.assertEqual(
             sorted(actions[0].choices),
-            ["build", "doctor", "exec", "run", "sync", "test"],
+            ["build", "doctor", "exec", "pull", "run", "sync", "test"],
         )
 
     def test_no_verb_from_a_later_phase_has_leaked_in(self):
         parser = cli.build_parser()
         actions = [a for a in parser._actions if a.dest == "verb"]
-        for later in ("pull", "logs", "shell"):
+        for later in ("logs", "shell"):
             self.assertNotIn(later, actions[0].choices)
 
     def test_help_states_that_the_mirror_deletes(self):

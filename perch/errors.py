@@ -84,6 +84,18 @@ class RunLockHeld(PerchError):
     exit_code = EXIT_LOCK_HELD
 
 
+class PullError(PerchError):
+    """Artifact retrieval (C6) failed - the target-side glob listing or the
+    rsync retrieving it exited non-zero.
+
+    No dedicated code in §7's table: pull is not part of the Mirror step
+    that table enumerates (73), and unlike sync it never runs before a
+    command that would otherwise execute against a partial result (I4 does
+    not apply). Falls through to the PerchError base's EXIT_INTERNAL, same
+    as any other unclassified operational failure.
+    """
+
+
 class Interrupted(PerchError):
     """Local SIGINT, and the remote process group was confirmed dead.
 

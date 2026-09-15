@@ -16,7 +16,9 @@ import shutil
 import subprocess
 import sys
 
-from perch import __version__, config, errors, executor, mirror
+from pathlib import Path
+
+from perch import __version__, artifacts, config, errors, executor, mirror
 from perch.config import COMMAND_VERBS
 from perch.session import Session
 
@@ -24,13 +26,21 @@ EPILOG = """\
 The target's copy of the workspace is derived and disposable: the mirror
 deletes, so a file removed locally is removed on the target. Anything generated
 on the target inside the project directory is lost on the next sync unless it
-is excluded in .perch.toml.
+is excluded in .perch.toml, or retrieved first with `pull` (or auto-pulled via
+[artifacts] after a successful run).
+
+`pull`'s default destination (.perch/artifacts/) is excluded from the mirror,
+so a pulled file is never pushed back to the target. An explicit destination
+you name yourself is NOT protected: if it lands inside the workspace and is
+not excluded, the next sync pushes it back, which can overwrite a fresher
+target-side build with your now-stale local copy.
 
 Configuration lives in .perch.toml, discovered by walking up from the working
 directory. Connection detail - user, address, port, key - belongs in
 ~/.ssh/config; perch only ever knows the alias.
 
-`doctor` is read-only: it does not sync and does not need [commands].
+`doctor` and `pull` are read-only: neither syncs, and `pull` does not need
+[commands].
 """
 
 
@@ -50,6 +60,20 @@ def build_parser() -> argparse.ArgumentParser:
     verbs.add_parser(
         "doctor",
         help="probe the target: identity, arch, memory, disk, toolchain, device files",
+    )
+
+    pull = verbs.add_parser(
+        "pull",
+        help="retrieve files matching a glob from the target (glob expands "
+        "on the TARGET's shell, not locally)",
+    )
+    pull.add_argument("glob", help="pattern, expanded on the target, relative to remote_root")
+    pull.add_argument(
+        "dest",
+        nargs="?",
+        default=None,
+        help="local destination directory (default: .perch/artifacts/, which "
+        "is excluded from the mirror so it is never pushed back - see --help)",
     )
 
     execute = verbs.add_parser(
@@ -156,6 +180,11 @@ def _dispatch(args: argparse.Namespace) -> int:
     if args.verb == "doctor":
         return _run_doctor(cfg, session)
 
+    if args.verb == "pull":
+        # Read-only, like doctor: no sync (there is nothing here that needs
+        # the workspace to match first), no run lock (not an execution).
+        return _run_pull(cfg, session, args.glob, args.dest)
+
     tty = getattr(args, "tty", False)
     json_sink = getattr(args, "json", False)
     replace = getattr(args, "replace", False)
@@ -203,9 +232,47 @@ def _dispatch(args: argparse.Namespace) -> int:
             "confirmed dead.",
             file=sys.stderr,
         )
+    elif result.exit_code == 0 and cfg.artifacts:
+        # Auto-pull (P4-2/C6): ONLY on the remote command's own exit 0 -
+        # ARCHITECTURE.md is explicit about that condition, not "the tool
+        # didn't error." Always stderr, json_sink or not - Settle-step
+        # housekeeping already goes there regardless of mode (P2-4's
+        # reaping notice, P2-6's indeterminate/interrupted wording), and
+        # --json's stdout must carry nothing but the event stream, which
+        # already ended with its own exit event before this runs.
+        _auto_pull(cfg, session)
     return errors.exit_code_for_run(
         result.exit_code, interrupted=result.interrupted, indeterminate=result.indeterminate
     )
+
+
+def _auto_pull(cfg: config.Config, session: Session) -> None:
+    """Pull every configured artifact glob, in order, stopping at the first
+    failure (PullError propagates - a secondary failure after an otherwise
+    successful run is still a real failure the caller should see, not one
+    to swallow silently)."""
+    for glob in cfg.artifacts:
+        matched = artifacts.pull(cfg, session, glob)
+        if matched:
+            print(
+                f"perch: pulled {len(matched)} file(s) matching {glob!r} into "
+                f"{artifacts.default_dest(cfg)}: {', '.join(matched)}",
+                file=sys.stderr,
+            )
+        else:
+            print(f"perch: no files matched {glob!r} - nothing to pull", file=sys.stderr)
+
+
+def _run_pull(cfg: config.Config, session: Session, glob: str, dest: str | None) -> int:
+    dest_path = Path(dest).resolve() if dest is not None else artifacts.default_dest(cfg)
+    matched = artifacts.pull(cfg, session, glob, dest_path)
+    if matched:
+        print(f"pulled {len(matched)} file(s) into {dest_path}:")
+        for path in matched:
+            print(f"  {path}")
+    else:
+        print(f"no files matched {glob!r} on {cfg.host}:{cfg.remote_root}")
+    return errors.EXIT_OK
 
 
 def _command_for(cfg: config.Config, args: argparse.Namespace) -> str:
