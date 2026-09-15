@@ -180,6 +180,26 @@ perch exec make -C subdir 2>&1 | grep ": error:"
 Expect the printed path to end in `subdir/sub_error.c`, not
 `sub_error.c` at the top level.
 
+**Known limitation, found while closing this gate, not fixed in Phase 3
+(chosen here):** this is a race, not a deterministic pass. `make`'s
+`Entering`/`Leaving directory` announcements arrive on stdout; the compiler's
+diagnostic arrives on stderr; these are two independent SSH channels, and
+nothing guarantees the local reader drains them in the remote emission order
+(confirmed live: `PathResolver` resolves correctly when fed the real
+line sequence directly in isolation, but the same `make -C subdir` invocation
+run repeatedly over SSH resolves correctly only part of the time - the
+`Leaving directory` line sometimes arrives, and pops the cwd stack, before the
+stderr diagnostic that was, in real time, written first). Fixing this for
+real would mean either merging remote stdout+stderr into one ordered channel
+(destroys the stdout/stderr distinction plain-mode display and `--json`'s
+`t: "stdout"/"stderr"` tagging both depend on - an ADR-level architecture
+change) or buffering to reorder (a direct I5 violation). Neither is a Phase 3
+fix. When the race loses, the diagnostic still names the correct file by
+basename and is never corrupted (I8 holds) - only the `subdir/` prefix is
+sometimes missing, so `ls` on the printed path can fail even though the text
+itself is gcc's own, untouched. Left as-is; revisit only if nested `make -C`
+turns out to matter in practice.
+
 ### 5. Offline suite, target unreachable (gate item 5)
 
 ```sh
