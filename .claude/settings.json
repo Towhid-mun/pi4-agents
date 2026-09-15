@@ -1,0 +1,14 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(perch build *)",
+      "Bash(perch test *)",
+      "Bash(perch run *)",
+      "Bash(perch sync *)",
+      "Bash(perch doctor *)",
+      "Bash(perch pull *)",
+      "Edit",
+      "Write"
+    ]
+  }
+}
