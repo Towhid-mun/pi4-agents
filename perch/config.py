@@ -22,6 +22,17 @@ COMMAND_VERBS = ("build", "test", "run")
 # Always excluded from the mirror, regardless of config (C3). The tool's own
 # config file is here because the target has no use for it and a stray copy
 # would be discovered by a walk-up on the target side.
+#
+# .perch/ (P4-1) holds the run lock at <remote_root>/.perch/run.lock. This is
+# NOT optional housekeeping: rsync's --delete removes any receiver-side path
+# the host tree doesn't have, and the host tree has no .perch/ at all (it is
+# purely a target-side artifact) - without this exclude, the mirror that
+# precedes every command would delete the lock the very command is about to
+# take, out from under itself, on every single invocation. Confirmed live
+# (T0, Phase 4): a probe file under .perch/ does not survive an unexcluded
+# `perch sync`, and does survive once this entry is in the exclude list -
+# rsync's --delete does not touch a receiver-side path an exclude rule
+# protects, without needing --delete-excluded (which we do not pass).
 BUILTIN_EXCLUDES = (
     ".git/",
     ".venv/",
@@ -31,6 +42,7 @@ BUILTIN_EXCLUDES = (
     "*.pyc",
     ".DS_Store",
     CONFIG_FILENAME,
+    ".perch/",
 )
 
 _TOP_LEVEL_KEYS = frozenset({"host", "remote_root", "exclude", "artifacts", "commands"})

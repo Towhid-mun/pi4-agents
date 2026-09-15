@@ -16,7 +16,7 @@ from unittest.mock import patch
 
 from perch import executor
 from perch.config import Config
-from perch.errors import InternalError, TargetUnreachable
+from perch.errors import InternalError, RunLockHeld, TargetUnreachable
 
 
 def make_config(**overrides) -> Config:
@@ -181,6 +181,41 @@ class TestBuildWrappedCommand(unittest.TestCase):
         # argument, not as a second top-level statement of the payload.
         inner_expected = f"cd root && {hostile}"
         self.assertIn(shlex.quote(inner_expected), payload)
+
+    def test_records_pgid_into_the_run_lock(self):
+        # P4-1: the same $PGID the marker protocol already computes is also
+        # written into the lock file, for free - no second ssh round trip.
+        cmd = executor.build_wrapped_command("myproj", "make", "tok")
+        self.assertIn(executor.lock_pgid_path("myproj"), cmd)
+        self.assertIn('printf "%s" "$PGID"', cmd)
+
+    def test_lock_write_happens_before_the_pgid_marker_is_printed(self):
+        cmd = executor.build_wrapped_command("myproj", "make", "tok")
+        lock_write_idx = cmd.index(executor.lock_pgid_path("myproj"))
+        marker_idx = cmd.index(executor.pgid_marker("tok"))
+        self.assertLess(lock_write_idx, marker_idx)
+
+
+class TestPtyCommand(unittest.TestCase):
+    def test_records_pgid_into_the_run_lock(self):
+        cfg = make_config(remote_root="myproj")
+        cmd = executor._pty_command(cfg, "./blinky")
+        self.assertIn(executor.lock_pgid_path("myproj"), cmd)
+
+    def test_execs_into_the_real_command_rather_than_staying_a_parent(self):
+        # exec replaces the shell in place (same pid/pgid) so the interactive
+        # program itself, not a wrapper shell, ends up as the pty's foreground
+        # process - required for native Ctrl-C delivery (ADR-2).
+        cfg = make_config(remote_root="myproj")
+        cmd = executor._pty_command(cfg, "./blinky")
+        self.assertIn("exec sh -c", cmd)
+
+    def test_no_setsid_or_marker_machinery(self):
+        # ADR-2: pty mode deliberately does not carry pipe mode's wrapper.
+        cfg = make_config(remote_root="myproj")
+        cmd = executor._pty_command(cfg, "./blinky")
+        self.assertNotIn("setsid", cmd)
+        self.assertNotIn("__PERCH_", cmd)
 
 
 class TestPgidRecord(unittest.TestCase):
@@ -352,6 +387,180 @@ class TestRunResult(unittest.TestCase):
         result = executor.RunResult(exit_code=0)
         self.assertFalse(result.interrupted)
         self.assertFalse(result.indeterminate)
+
+
+# --------------------------------------------------------------------------
+# P4-1: the run lock.
+# --------------------------------------------------------------------------
+
+class TestLockPaths(unittest.TestCase):
+    def test_lock_dir_lives_under_dot_perch(self):
+        self.assertEqual(executor.lock_dir("myproj"), "myproj/.perch/run.lock")
+
+    def test_pgid_path_is_inside_the_lock_dir(self):
+        self.assertEqual(executor.lock_pgid_path("myproj"), "myproj/.perch/run.lock/pgid")
+
+    def test_trailing_slash_on_remote_root_does_not_double_up(self):
+        self.assertEqual(executor.lock_dir("myproj/"), "myproj/.perch/run.lock")
+
+
+class TestClaimCommand(unittest.TestCase):
+    def test_the_exclusion_boundary_is_a_bare_mkdir_not_dash_p(self):
+        # Trap 1: mkdir -p never fails on "already exists", so it cannot be
+        # the atomic gate - only a bare mkdir on the lock dir itself can be.
+        cmd = executor._claim_command("myproj")
+        self.assertIn("mkdir -p myproj/.perch", cmd)
+        self.assertIn("mkdir myproj/.perch/run.lock", cmd)
+        self.assertNotIn("mkdir -p myproj/.perch/run.lock", cmd)
+
+    def test_reports_claimed_on_success(self):
+        self.assertIn("echo CLAIMED", executor._claim_command("myproj"))
+
+    def test_reports_the_holder_pgid_on_failure(self):
+        cmd = executor._claim_command("myproj")
+        self.assertIn(f"cat {shlex.quote(executor.lock_pgid_path('myproj'))}", cmd)
+
+
+class TestReleaseCommand(unittest.TestCase):
+    def test_removes_the_whole_lock_directory(self):
+        self.assertEqual(
+            executor._release_command("myproj"),
+            f"rm -rf {shlex.quote(executor.lock_dir('myproj'))}",
+        )
+
+
+class FakeLockSession:
+    """A session double for acquire_lock/release_lock (P4-1). Routes on the
+    command's own shape, since one acquire_lock call can issue several
+    different remote commands (claim, read holder pgid, pgrep, kill, rm)."""
+
+    def __init__(self, claim_outputs=(), pgid_outputs=(), alive_sequence=(), raise_unreachable=False):
+        self.claim_outputs = list(claim_outputs)
+        self.pgid_outputs = list(pgid_outputs)
+        self.alive_sequence = list(alive_sequence)
+        self.raise_unreachable = raise_unreachable
+        self.calls: list[str] = []
+
+    def run_capturing(self, remote_command: str, *, input=None):
+        self.calls.append(remote_command)
+        if self.raise_unreachable:
+            raise TargetUnreachable("pi: unreachable")
+        if remote_command.startswith("mkdir -p"):
+            out = self.claim_outputs.pop(0) if self.claim_outputs else "CLAIMED"
+            return FakeCompleted(returncode=0, stdout=out)
+        if remote_command.startswith("cat "):
+            out = self.pgid_outputs.pop(0) if self.pgid_outputs else ""
+            return FakeCompleted(returncode=0, stdout=out)
+        if remote_command.startswith("pgrep"):
+            alive = self.alive_sequence.pop(0) if self.alive_sequence else False
+            return FakeCompleted(returncode=0 if alive else 1)
+        return FakeCompleted(returncode=0)  # rm -rf, kill -*
+
+
+class TestAcquireLock(unittest.TestCase):
+    def test_claims_immediately_when_free(self):
+        cfg = make_config(remote_root="myproj")
+        session = FakeLockSession(claim_outputs=["CLAIMED"])
+        executor.acquire_lock(cfg, session)  # must not raise
+        self.assertEqual(len(session.calls), 1)
+
+    def test_raises_75_naming_the_holder_when_alive(self):
+        cfg = make_config(remote_root="myproj")
+        session = FakeLockSession(claim_outputs=["4242"], alive_sequence=[True])
+        with self.assertRaises(RunLockHeld) as ctx:
+            executor.acquire_lock(cfg, session)
+        self.assertIn("4242", str(ctx.exception))
+        self.assertEqual(ctx.exception.exit_code, 75)
+
+    def test_reclaims_automatically_when_holder_is_dead_no_replace_needed(self):
+        cfg = make_config(remote_root="myproj")
+        session = FakeLockSession(claim_outputs=["4242", "CLAIMED"], alive_sequence=[False])
+        executor.acquire_lock(cfg, session)  # must not raise
+        self.assertTrue(any(c.startswith("rm -rf") for c in session.calls))
+
+    def test_never_removes_a_lock_without_confirming_the_holder_dead_first(self):
+        cfg = make_config(remote_root="myproj")
+        session = FakeLockSession(claim_outputs=["4242"], alive_sequence=[True])
+        with self.assertRaises(RunLockHeld):
+            executor.acquire_lock(cfg, session)
+        self.assertFalse(any(c.startswith("rm -rf") for c in session.calls))
+
+    def test_replace_kills_the_live_holder_then_takes_over(self):
+        cfg = make_config(remote_root="myproj")
+        session = FakeLockSession(claim_outputs=["4242", "CLAIMED"], alive_sequence=[True, False])
+        with patch.object(executor, "TERM_GRACE_SECONDS", 0):
+            executor.acquire_lock(cfg, session, replace=True)  # must not raise
+        self.assertIn("kill -TERM -- -4242", session.calls)
+        self.assertTrue(any(c.startswith("rm -rf") for c in session.calls))
+
+    def test_replace_raises_internal_error_if_the_holder_will_not_die(self):
+        cfg = make_config(remote_root="myproj")
+        # 3 liveness checks: acquire_lock's own initial one, then
+        # _terminate_group's TERM-phase poll and KILL-phase poll.
+        session = FakeLockSession(claim_outputs=["4242"], alive_sequence=[True, True, True])
+        with patch.object(executor, "TERM_GRACE_SECONDS", 0), \
+             patch.object(executor, "KILL_GRACE_SECONDS", 0):
+            with self.assertRaises(InternalError):
+                executor.acquire_lock(cfg, session, replace=True)
+        # Never removed a lock it could not confirm dead.
+        self.assertFalse(any(c.startswith("rm -rf") for c in session.calls))
+
+    def test_without_replace_a_live_holder_is_never_killed(self):
+        cfg = make_config(remote_root="myproj")
+        session = FakeLockSession(claim_outputs=["4242"], alive_sequence=[True])
+        with self.assertRaises(RunLockHeld):
+            executor.acquire_lock(cfg, session, replace=False)
+        self.assertFalse(any(c.startswith("kill") for c in session.calls))
+
+    def test_a_lock_just_claimed_by_a_competitor_with_no_pgid_yet_is_treated_as_held(self):
+        # The narrow race: another invocation's mkdir landed but its own
+        # pgid write has not - conservatively refuse rather than guess.
+        cfg = make_config(remote_root="myproj")
+        session = FakeLockSession(claim_outputs=[""], pgid_outputs=[""])
+        with patch.object(executor, "LOCK_STALE_RETRY_DELAY", 0):
+            with self.assertRaises(RunLockHeld) as ctx:
+                executor.acquire_lock(cfg, session)
+        self.assertIn("not been recorded yet", str(ctx.exception))
+
+    def test_a_lock_whose_pgid_appears_after_the_short_wait_is_handled_normally(self):
+        cfg = make_config(remote_root="myproj")
+        session = FakeLockSession(
+            claim_outputs=["", "CLAIMED"], pgid_outputs=["777"], alive_sequence=[False]
+        )
+        with patch.object(executor, "LOCK_STALE_RETRY_DELAY", 0):
+            executor.acquire_lock(cfg, session)  # must not raise
+        self.assertTrue(any(c.startswith("rm -rf") for c in session.calls))
+
+    def test_persistent_dead_relock_contention_exhausts_retries(self):
+        cfg = make_config(remote_root="myproj")
+        session = FakeLockSession(
+            claim_outputs=["4242", "111", "222", "333"],
+            alive_sequence=[False, False, False, False],
+        )
+        with self.assertRaises(InternalError):
+            executor.acquire_lock(cfg, session)
+
+    def test_a_live_relock_race_raises_lock_held_not_internal_error(self):
+        # After we've reclaimed a confirmed-dead lock, a genuinely different,
+        # live invocation beat us to the re-claim - that is ordinary
+        # contention (75), not a tool bug (70).
+        cfg = make_config(remote_root="myproj")
+        session = FakeLockSession(claim_outputs=["4242", "999"], alive_sequence=[False, True])
+        with self.assertRaises(RunLockHeld) as ctx:
+            executor.acquire_lock(cfg, session)
+        self.assertIn("999", str(ctx.exception))
+
+
+class TestReleaseLock(unittest.TestCase):
+    def test_removes_the_lock_directory(self):
+        cfg = make_config(remote_root="myproj")
+        session = FakeLockSession()
+        executor.release_lock(cfg, session)
+        self.assertEqual(session.calls, [executor._release_command("myproj")])
+
+    def test_unreachable_target_is_swallowed_not_raised(self):
+        cfg = make_config(remote_root="myproj")
+        executor.release_lock(cfg, FakeLockSession(raise_unreachable=True))  # must not raise
 
 
 if __name__ == "__main__":

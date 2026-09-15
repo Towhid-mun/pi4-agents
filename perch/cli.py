@@ -86,8 +86,14 @@ def build_parser() -> argparse.ArgumentParser:
         sub.add_argument(
             "--json",
             action="store_true",
-            help="structured event stream on stdout (Phase 3 - not yet "
-            "implemented; recognized now only so --tty --json can be refused)",
+            help="structured event stream on stdout",
+        )
+        sub.add_argument(
+            "--replace",
+            action="store_true",
+            help="take the run lock from a live holder: kill that process "
+            "group first (confirmed dead), then take over. Without this, a "
+            "held lock fails fast (exit 75) naming the holder.",
         )
 
     return parser
@@ -152,6 +158,7 @@ def _dispatch(args: argparse.Namespace) -> int:
 
     tty = getattr(args, "tty", False)
     json_sink = getattr(args, "json", False)
+    replace = getattr(args, "replace", False)
     if tty and json_sink:
         # P2-5: a pty's streams are merged and carry control characters -
         # C5 (Phase 3) cannot classify that into structured events. Refused
@@ -174,8 +181,10 @@ def _dispatch(args: argparse.Namespace) -> int:
 
     command = _command_for(cfg, args)
 
-    # 5 Execute.
-    result = executor.run(cfg, command, session, tty=tty, json_mode=json_sink)
+    # 4 Claim, 5 Execute. run() takes the lock (exit 75 if held and not
+    # --replace) before either mode ever runs the command, and releases it
+    # on every path out (P4-1).
+    result = executor.run(cfg, command, session, tty=tty, json_mode=json_sink, replace=replace)
 
     # 7 Settle. Phase 0/1 settled by propagating the status alone; P2 adds
     # the interrupted/indeterminate outcomes C4 can now report. P2-6 requires

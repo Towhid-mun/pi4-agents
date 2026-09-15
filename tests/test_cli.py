@@ -48,10 +48,11 @@ class SequenceTestCase(unittest.TestCase):
             if self.sync_error is not None:
                 raise self.sync_error
 
-        def run(cfg, command, session, *, tty=False, json_mode=False):
+        def run(cfg, command, session, *, tty=False, json_mode=False, replace=False):
             self.calls.append(("execute", command))
             self.last_tty = tty
             self.last_json_mode = json_mode
+            self.last_replace = replace
             return executor.RunResult(exit_code=self.exit_code)
 
         for module, name, replacement in (
@@ -197,7 +198,7 @@ class TestSettleOutcomes(SequenceTestCase):
     the number half of this contract."""
 
     def run_with(self, **result_kwargs):
-        def run(cfg, command, session, *, tty=False, json_mode=False):
+        def run(cfg, command, session, *, tty=False, json_mode=False, replace=False):
             self.calls.append(("execute", command))
             return executor.RunResult(exit_code=result_kwargs.pop("exit_code", 1), **result_kwargs)
 
