@@ -224,7 +224,23 @@ Not success. Not failure.
 This is the phase that turns the tool from usable-by-a-person into
 usable-by-an-agent. All of it is testable offline.
 
-**P3-1 · Diagnostic parsers (C5)** `M` — *needs P2-1*
+**Build order actually used: P3-4, then P3-1, P3-2, P3-3** — inverted from the
+numbering below, on instruction. The dependency as originally written
+("P3-4 needs P3-1") assumed the corpus would be recorded to validate an
+already-written parser; it was built the other way instead, so the parser
+would be written against real recorded gcc/clang/Python output rather than
+against a remembered guess at their format. P3-4 has no real dependency on
+P3-1 - it only needs a reachable target to capture from, once, and never
+again afterward.
+
+**P3-4 · Fixture corpus and offline suite** `S` — *needs a reachable target,
+once, to record from - not P3-1*
+Recorded real output: a gcc error, a gcc warning, a linker error, a Python
+traceback, a clean build, and one file of noise. These are the fast feedback
+loop; keep them network-free forever.
+*Done when:* the whole C1/C3/C5 suite runs with no target reachable.
+
+**P3-1 · Diagnostic parsers (C5)** `M` — *needs P2-1, P3-4's fixtures*
 GCC/Clang `path:line:col: severity: message`, and Python `File "path", line N`.
 Streaming, line at a time. **An unrecognized line passes through byte-identical**
 (I8) — this is the property most likely to be broken by a careless regex.
@@ -243,12 +259,6 @@ line, including the terminal `exit` event. Stream stays flushed per event — a
 consumer must be able to react before the process ends.
 *Done when:* `perch build --json` on a failing build emits `diag` events with
 local paths, then one `exit` event, and every line parses as JSON.
-
-**P3-4 · Fixture corpus and offline suite** `S` — *needs P3-1*
-Recorded real output: a gcc error, a gcc warning, a linker error, a Python
-traceback, a clean build, and one file of noise. These are the fast feedback
-loop; keep them network-free forever.
-*Done when:* the whole C1/C3/C5 suite runs with no target reachable.
 
 ---
 
