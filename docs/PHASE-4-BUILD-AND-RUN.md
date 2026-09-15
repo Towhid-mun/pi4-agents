@@ -47,6 +47,7 @@ without `--delete-excluded` (never passed here).
 perch/artifacts.py     C6 - artifact retrieval (pull, auto-pull)
 --replace               take the run lock from a live holder
 perch pull <glob> [dest]
+--force-sync             P4-4 - bypass the sync fast path
 ```
 
 `perch/executor.py` gains the run lock (`acquire_lock`/`release_lock`,
@@ -54,6 +55,9 @@ perch pull <glob> [dest]
 `run()`'s own `try`/`finally`. `perch/config.py`'s `BUILTIN_EXCLUDES` gains
 `.perch/` - load-bearing, not cosmetic (see T0 above and P4-2's round-trip
 section below, which both depend on it).
+
+`perch/mirror.py` gains the sync fast path (`content_hash`, `push`'s
+`force_sync`) - see "Design decisions" below.
 
 ## Design decisions this document fixes
 
@@ -90,6 +94,50 @@ round trip, and no window where the lock exists but names nobody, since
 that write happens inside a script that, by construction, only ever runs
 after `acquire_lock` has already succeeded.
 
+**Sync fast path (P4-4), and why one signal was not enough:** the obvious
+design - cache a local content hash after every real sync, skip rsync when
+the current hash still matches - was built first, and it false-skips.
+Provoked live: sync, then `ssh pi 'echo ... >> file'` (a direct edit on the
+target, bypassing perch entirely), then sync again with the local tree
+untouched. A hash keyed purely on the local tree cannot see a change that
+never touched the local tree - the skip fired, and the target's manual
+edit survived a sync that should have overwritten it. Not an edge case:
+this is *exactly* the scenario the Phase 4 gate's own done-when (§ item 6)
+names.
+
+Rejected fixes: hashing the *remote* tree's content on every candidate
+skip (same full-content read+checksum cost as just running rsync -
+defeats the fast path entirely) and trusting mtime on either side (I3
+exists because this target's clock cannot be trusted - reusing mtime here
+reopens that exact hole from a new angle).
+
+**Chosen here:** two independent, cheap signals, both local-hash and
+remote-manifest, have to agree before a sync is skipped.
+
+1. `content_hash()` - local, full-content sha256, unchanged from the first
+   attempt. Detects a *local* edit for free (no network at all).
+2. `_remote_matches_local_sizes()` - ONE extra ssh round trip added for
+   this: `find -printf '%s\t%P\n'` on the target (stat only, no content
+   ever read or transferred), compared against the current local tree's
+   own (relpath, size) list. Detects target-side drift - reusing sizes,
+   never mtimes, keeps this outside I3's blast radius.
+
+Confirmed live, all three P4-4 done-when clauses: (a) an unchanged sync
+skips and is measurably faster (0.292s real sync vs 0.129s skip on the
+integration fixtures project - the gap widens with tree size, since the
+skip path never reads file content on either side); (b) one changed local
+byte reliably un-skips (rsync ran, target updated); (c) the exact
+false-skip repro above, re-run against the fixed code: the size-manifest
+check disagreed, rsync ran, and the target's direct edit was overwritten
+by the real local content - no false skip.
+
+What this still cannot catch: a same-size content edit made directly on
+the target (the manifest check only compares size + path, not content -
+comparing content would cost what rsync itself costs). `--force-sync` is
+the escape hatch for a target known or suspected to have diverged out of
+band; the skip's own stderr line is loud specifically so a suspicious
+build has something to point at.
+
 ## Failure matrix (P4-3)
 
 Every row of `ARCHITECTURE.md` §8, provoked for real against the Pi. The
@@ -114,6 +162,7 @@ live and writing down how to provoke it again.
 | `.vscode/tasks.json`, `CLAUDE.md`, `perch init` | Phase 5 |
 | A file watcher | Not planned - ADR-4 |
 | Multi-level nested `make -C` cwd tracking is implemented but never exercised against a real nested build (Phase 3 carryover) | untested, not phase-gated |
+| P4-4's fast path can miss a same-size, different-content edit made directly on the target (its remote check compares size + path only, not content - see "Design decisions" above) | Not planned - use `--force-sync` when the target is known or suspected to have diverged out of band |
 
 ## Troubleshooting
 
@@ -122,3 +171,5 @@ live and writing down how to provoke it again.
 | `perch build`/`exec`/`run` exits 75 unexpectedly | Another invocation (possibly from a different machine) genuinely holds the lock, or a previous one crashed hard enough that its process is still alive on the target | The error message names the holder's pgid - `ssh <host> "ps -o pid,pgid,cmd -g <pgid>"` to see what it is; `--replace` if you are sure it should not be there |
 | Pulled artifacts keep reappearing in `git status` / look tracked | `.perch/artifacts/` is excluded from the *mirror*, not from git - add `.perch/` to `.gitignore` if using git | n/a - this is a host-side convention, not a perch behavior |
 | `chmod`-ing the target directory does not provoke a sync failure | rsync's `-a` restores directory permissions to match the source as part of the same transfer - see failure matrix row 3's note | Use a real obstruction instead: an occupied path (`touch` where a directory needs to be) or an immutable file (`chattr +i`) |
+| A build seems to run against stale/wrong content, and stderr said "sync skipped" | The fast path (P4-4) decided nothing had changed | Re-run with `--force-sync`; if the target really did diverge out of band, this is expected once - the cache and remote manifest both refresh after that one real sync |
+| `perch sync`/`build` never skips even though nothing changed | `.perch/sync-cache.json` under the project is missing, unreadable, or the project's `host`/`remote_root` changed since it was written - all treated as a cache miss on purpose | Not a bug: run once to re-prime the cache, then the next unchanged run should skip |

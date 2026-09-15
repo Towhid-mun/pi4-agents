@@ -43,9 +43,10 @@ class SequenceTestCase(unittest.TestCase):
             self.calls.append(("resolve", None))
             return self.cfg
 
-        def push(cfg, session, *, quiet=False):
+        def push(cfg, session, *, quiet=False, force_sync=False):
             self.calls.append(("mirror", None))
             self.last_quiet = quiet
+            self.last_force_sync = force_sync
             if self.sync_error is not None:
                 raise self.sync_error
 
@@ -204,6 +205,18 @@ class TestTtyAndJson(SequenceTestCase):
     def test_replace_defaults_to_false(self):
         self.invoke(["build"])
         self.assertFalse(self.last_replace)
+
+    def test_force_sync_reaches_the_mirror(self):
+        self.invoke(["build", "--force-sync"])
+        self.assertTrue(self.last_force_sync)
+
+    def test_force_sync_defaults_to_false(self):
+        self.invoke(["build"])
+        self.assertFalse(self.last_force_sync)
+
+    def test_force_sync_works_on_sync_too(self):
+        self.invoke(["sync", "--force-sync"])
+        self.assertTrue(self.last_force_sync)
 
 
 class TestPullVerb(SequenceTestCase):

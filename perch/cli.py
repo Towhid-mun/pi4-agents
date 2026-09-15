@@ -41,6 +41,11 @@ directory. Connection detail - user, address, port, key - belongs in
 
 `doctor` and `pull` are read-only: neither syncs, and `pull` does not need
 [commands].
+
+A sync is skipped entirely when the local content hash matches the one
+recorded after the last real sync (.perch/sync-cache.json) - this can never
+see a change made directly on the target (e.g. over your own ssh session),
+only a change on the host. Pass --force-sync to always run rsync.
 """
 
 
@@ -55,7 +60,15 @@ def build_parser() -> argparse.ArgumentParser:
 
     verbs = parser.add_subparsers(dest="verb", metavar="<verb>", required=True)
 
-    verbs.add_parser("sync", help="mirror the workspace to the target and stop")
+    sync = verbs.add_parser("sync", help="mirror the workspace to the target and stop")
+    sync.add_argument(
+        "--force-sync",
+        action="store_true",
+        help="run rsync even if the fast path (P4-4) would otherwise skip "
+        "it because the local content hash matches the last known-synced "
+        "state - use this if the target may have diverged out of band "
+        "(e.g. an edit made directly on it over ssh)",
+    )
 
     verbs.add_parser(
         "doctor",
@@ -118,6 +131,14 @@ def build_parser() -> argparse.ArgumentParser:
             help="take the run lock from a live holder: kill that process "
             "group first (confirmed dead), then take over. Without this, a "
             "held lock fails fast (exit 75) naming the holder.",
+        )
+        sub.add_argument(
+            "--force-sync",
+            action="store_true",
+            help="run rsync even if the fast path (P4-4) would otherwise "
+            "skip it because the local content hash matches the last "
+            "known-synced state - use this if the target may have diverged "
+            "out of band (e.g. an edit made directly on it over ssh)",
         )
 
     return parser
@@ -188,6 +209,7 @@ def _dispatch(args: argparse.Namespace) -> int:
     tty = getattr(args, "tty", False)
     json_sink = getattr(args, "json", False)
     replace = getattr(args, "replace", False)
+    force_sync = getattr(args, "force_sync", False)
     if tty and json_sink:
         # P2-5: a pty's streams are merged and carry control characters -
         # C5 (Phase 3) cannot classify that into structured events. Refused
@@ -203,7 +225,7 @@ def _dispatch(args: argparse.Namespace) -> int:
     # aborts before step 5 (I4). quiet=json_sink: P3-3 requires stdout carry
     # only JSON in --json mode, and rsync's own itemized change list is tool
     # progress, not part of the remote command's diagnostic stream.
-    mirror.push(cfg, session, quiet=json_sink)
+    mirror.push(cfg, session, quiet=json_sink, force_sync=force_sync)
 
     if args.verb == "sync":
         return errors.EXIT_OK
