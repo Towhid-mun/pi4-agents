@@ -96,6 +96,10 @@ line 4, column 40.
 
 ## Further reading
 
+- [`docs/USER-GUIDE.md`](docs/USER-GUIDE.md) - the full walkthrough:
+  configuring SSH, creating a project (new or existing), a C++ and a
+  Python hello world, `perch doctor`, retrieving files with `pull`, and
+  every command and flag.
 - [`architecture/ARCHITECTURE.md`](architecture/ARCHITECTURE.md) - the
   authoritative contract: invariants, components, the exit-code contract,
   the failure matrix.
