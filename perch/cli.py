@@ -76,6 +76,25 @@ def build_parser() -> argparse.ArgumentParser:
         help="probe the target: identity, arch, memory, disk, toolchain, device files",
     )
 
+    init = verbs.add_parser(
+        "init",
+        help="scaffold .perch.toml, .vscode/tasks.json and a CLAUDE.md into "
+        "the current directory, then run doctor",
+    )
+    init.add_argument(
+        "alias",
+        nargs="?",
+        default=None,
+        help="ssh alias from ~/.ssh/config (omit to choose interactively "
+        "from the aliases found there)",
+    )
+    init.add_argument(
+        "--force",
+        action="store_true",
+        help="overwrite any of .perch.toml / .vscode/tasks.json / CLAUDE.md "
+        "that already exist (default: leave them alone and say so)",
+    )
+
     pull = verbs.add_parser(
         "pull",
         help="retrieve files matching a glob from the target (glob expands "
@@ -219,6 +238,11 @@ def _refuse_if_running_on_the_target() -> None:
 def _dispatch(args: argparse.Namespace) -> int:
     _refuse_if_running_on_the_target()
 
+    if args.verb == "init":
+        # Scaffolds the very config step 1 (Resolve) is about to require -
+        # runs before config.load(), the only verb that must.
+        return _run_init(args.alias, force=args.force)
+
     # 1 Resolve. Fail on an unresolvable target before doing anything else.
     cfg = config.load()
 
@@ -336,6 +360,278 @@ def _command_for(cfg: config.Config, args: argparse.Namespace) -> str:
     if args.args:
         command = f"{command} {executor.join(args.args)}"
     return command
+
+
+# --------------------------------------------------------------------------
+# init (P5-3, C8) - onboarding. Thin, like the rest of Phase 5: it writes
+# the same three artifacts a person would otherwise copy by hand
+# (.perch.toml, .vscode/tasks.json, a CLAUDE.md) and then runs the
+# already-existing `doctor` verb, so the very first thing this command
+# does after scaffolding is prove (or disprove) that what it wrote works -
+# "it works" or a precise statement of what's missing, never silence.
+#
+# The one deliberate exception to I9 ("every command works
+# non-interactively") in this whole tool: with no alias argument, this
+# prompts on stdin. That is what the ticket asks for ("with no argument,
+# list the aliases... and ask") and it is inherent to a one-time,
+# by-a-human onboarding command - not something an agent's build loop ever
+# calls this way. An agent (or a script) should always pass the alias
+# explicitly (`perch init pi`), which never prompts. Called with no
+# argument and no terminal to ask on, it fails fast rather than hanging.
+# --------------------------------------------------------------------------
+
+_TASKS_JSON_TEMPLATE = """\
+// perch's editor integration (P5-1 / C8). Thin: these tasks call the perch
+// CLI and nothing else. See docs/PHASE-5-BUILD-AND-RUN.md for how the
+// problem matcher below was derived and verified against real output.
+//
+// *** DO NOT open this project with VS Code Remote-SSH connected to the target. ***
+// These tasks assume they are running on the HOST. If the window is
+// attached to the target over Remote-SSH, the task's shell runs ON THE
+// TARGET, so `perch` (which itself shells out to `ssh <alias>`) would try
+// to SSH from the target to itself. It will not fail cleanly. Open this
+// project in a plain LOCAL window (the remote indicator, if your editor
+// has one, should read nothing - never a Remote-SSH host).
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "perch: build",
+      "type": "shell",
+      "command": "perch",
+      "args": ["build"],
+      "group": { "kind": "build", "isDefault": true },
+      "presentation": { "reveal": "always", "panel": "shared", "clear": true },
+      "problemMatcher": {
+        // C5 (perch/diagnostics.py) rewrites a diagnostic's file field to
+        // an ABSOLUTE local path before this ever reaches the terminal, so
+        // fileLocation is "absolute" - NOT ["relative", "${workspaceFolder}"].
+        "owner": "perch",
+        "applyTo": "allDocuments",
+        "fileLocation": "absolute",
+        "pattern": {
+          "regexp": "^(.*?):(\\\\d+):(\\\\d+):\\\\s+(error|warning):\\\\s+(.*)$",
+          "file": 1,
+          "line": 2,
+          "column": 3,
+          "severity": 4,
+          "message": 5
+        }
+      }
+    },
+    {
+      "label": "perch: test",
+      "type": "shell",
+      "command": "perch",
+      "args": ["test"],
+      "group": { "kind": "test", "isDefault": true },
+      "presentation": { "reveal": "always", "panel": "shared", "clear": true },
+      "problemMatcher": {
+        "owner": "perch",
+        "applyTo": "allDocuments",
+        "fileLocation": "absolute",
+        "pattern": {
+          "regexp": "^(.*?):(\\\\d+):(\\\\d+):\\\\s+(error|warning):\\\\s+(.*)$",
+          "file": 1,
+          "line": 2,
+          "column": 3,
+          "severity": 4,
+          "message": 5
+        }
+      }
+    },
+    {
+      "label": "perch: run",
+      "type": "shell",
+      "command": "perch",
+      "args": ["run"],
+      "group": "none",
+      "presentation": { "reveal": "always", "panel": "shared", "clear": true },
+      "problemMatcher": {
+        "owner": "perch",
+        "applyTo": "allDocuments",
+        "fileLocation": "absolute",
+        "pattern": {
+          "regexp": "^(.*?):(\\\\d+):(\\\\d+):\\\\s+(error|warning):\\\\s+(.*)$",
+          "file": 1,
+          "line": 2,
+          "column": 3,
+          "severity": 4,
+          "message": 5
+        }
+      }
+    },
+    {
+      "label": "perch: doctor",
+      "type": "shell",
+      "command": "perch",
+      "args": ["doctor"],
+      "group": "none",
+      "presentation": { "reveal": "always", "panel": "shared", "clear": true },
+      "problemMatcher": []
+    }
+  ]
+}
+"""
+
+_CLAUDE_MD_TEMPLATE = """\
+# Agent instructions
+
+This project builds, tests and runs on a remote target through `perch`
+(`perch --help`), never locally.
+
+- **Never build or run this project's code locally.** Only the target can
+  compile and run it - use `perch build` / `perch test` / `perch run` /
+  `perch exec <cmd>`.
+- **This workspace is the source of truth.** The target's copy is derived
+  and disposable - the mirror deletes, so a file removed here is removed
+  there too on the next sync.
+- **Target-side output that matters comes back with `perch pull`.**
+  Anything generated on the target and not pulled (or listed under
+  `[artifacts]` in `.perch.toml`) is lost on the next sync.
+"""
+
+
+def _list_ssh_aliases() -> list[str]:
+    """Host patterns from ~/.ssh/config, in file order, skipping any
+    pattern containing a wildcard/negation character (`*`, `?`, `!`) -
+    `Host *` and similar catch-alls are ssh_config plumbing, not a target
+    a project would ever name. A line may list several patterns
+    space-separated (real ssh_config syntax); each is considered on its
+    own, in order, so a wildcard sitting next to a real alias on the same
+    line does not hide the real one.
+    """
+    ssh_config = Path.home() / ".ssh" / "config"
+    if not ssh_config.is_file():
+        return []
+    aliases = []
+    for line in ssh_config.read_text().splitlines():
+        parts = line.strip().split()
+        if len(parts) < 2 or parts[0].lower() != "host":
+            continue
+        for pattern in parts[1:]:
+            if any(c in pattern for c in "*?!"):
+                continue
+            aliases.append(pattern)
+    return aliases
+
+
+def _choose_ssh_alias() -> str:
+    aliases = _list_ssh_aliases()
+    if not aliases:
+        raise errors.ConfigError(
+            "no ssh alias given, and none found in ~/.ssh/config to choose "
+            "from. Add a Host entry there (see docs/PHASE-5-BUILD-AND-RUN.md), "
+            "or run `perch init <alias>` directly."
+        )
+    if not sys.stdin.isatty():
+        raise errors.ConfigError(
+            "no ssh alias given, and stdin is not a terminal to ask "
+            "interactively. Run `perch init <alias>` with an explicit alias."
+        )
+    print("ssh aliases found in ~/.ssh/config:", file=sys.stderr)
+    for index, alias in enumerate(aliases, start=1):
+        print(f"  {index}. {alias}", file=sys.stderr)
+    while True:
+        try:
+            choice = input(f"Choose a target [1-{len(aliases)}]: ").strip()
+        except EOFError:
+            raise errors.ConfigError("no choice made - run `perch init <alias>` instead") from None
+        if choice.isdigit() and 1 <= int(choice) <= len(aliases):
+            return aliases[int(choice) - 1]
+        print(f"not a number from 1 to {len(aliases)}", file=sys.stderr)
+
+
+def _guess_build_command(project_dir: Path) -> str | None:
+    """The one command P5-3 actually guesses - `test`/`run` are too
+    project-specific to guess safely and are left as commented examples
+    instead (see _render_perch_toml)."""
+    if (project_dir / "Makefile").is_file() or (project_dir / "makefile").is_file():
+        return "make"
+    if (project_dir / "pyproject.toml").is_file():
+        return "python3 -m build"
+    return None
+
+
+def _render_perch_toml(alias: str, project_dir: Path) -> str:
+    """COMMENTS explaining each field - for most users this generated file
+    IS the documentation, not something they read ARCHITECTURE.md to
+    understand first."""
+    remote_root = f"perch/{project_dir.name}"
+    guessed_build = _guess_build_command(project_dir)
+    build_line = f'build = "{guessed_build}"' if guessed_build else '# build = "make"'
+    return f"""\
+# perch project configuration, written by `perch init`.
+# For the full command surface: `perch --help`.
+
+# The ssh alias to build/run on. Resolved entirely by ssh via your own
+# ~/.ssh/config - perch never stores a hostname, port, user or key.
+host = "{alias}"
+
+# Where the project lives on the target, relative to $HOME there (or an
+# absolute path). Guessed from this directory's own name.
+remote_root = "{remote_root}"
+
+# Extra glob patterns to exclude from the mirror, one per line, beyond the
+# built-in list (.git/, .venv/, __pycache__/, node_modules/, *.o, *.pyc,
+# .DS_Store, .perch.toml, .perch/).
+# exclude = ["build/", "*.bin"]
+
+# Globs auto-pulled from the target into .perch/artifacts/ after every
+# successful run. Anything generated on the target and not listed here
+# (or retrieved with `perch pull`) is lost on the next sync.
+# artifacts = ["main"]
+
+[commands]
+# Shell commands run on the target, inside remote_root, after every sync.
+# Extra arguments given to `perch build`/`test`/`run` are appended to these.
+{build_line}
+# test = "make test"
+# `run` gets its OWN sync first, same as every verb - a binary built by a
+# separate, earlier `perch build` exists only on the target, so that sync
+# deletes it (I2) before this command ever runs. Rebuild in the same
+# command, don't rely on a previous build's artifact surviving:
+# run = "make && ./main"
+"""
+
+
+def _write_scaffold_file(path: Path, content: str, *, force: bool) -> bool:
+    """Writes `content` to `path` unless it already exists and `force` is
+    False. Returns whether it was (over)written, so the caller can report
+    exactly what happened - P5-3's own done-when includes "must say which
+    files it wrote"."""
+    if path.exists() and not force:
+        return False
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(content)
+    return True
+
+
+def _run_init(alias: str | None, *, force: bool) -> int:
+    if alias is None:
+        alias = _choose_ssh_alias()
+
+    project_dir = Path.cwd()
+    scaffold = (
+        (project_dir / config.CONFIG_FILENAME, _render_perch_toml(alias, project_dir)),
+        (project_dir / ".vscode" / "tasks.json", _TASKS_JSON_TEMPLATE),
+        (project_dir / "CLAUDE.md", _CLAUDE_MD_TEMPLATE),
+    )
+    for path, content in scaffold:
+        relative = path.relative_to(project_dir)
+        if _write_scaffold_file(path, content, force=force):
+            print(f"perch: wrote {relative}", file=sys.stderr)
+        else:
+            print(
+                f"perch: {relative} already exists - left it alone (--force to overwrite)",
+                file=sys.stderr,
+            )
+
+    perch_toml = project_dir / config.CONFIG_FILENAME
+    print(f"perch: running `perch doctor` against {alias!r}...", file=sys.stderr)
+    cfg = config.load_file(perch_toml)
+    session = Session(cfg.host)
+    return _run_doctor(cfg, session)
 
 
 # --------------------------------------------------------------------------

@@ -6,6 +6,8 @@ the class level, since cli.py constructs its own Session internally.
 """
 
 import io
+import os
+import tempfile
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import dataclass
@@ -376,12 +378,12 @@ class TestArgumentSurface(unittest.TestCase):
             cli.main(["--help"])
         self.assertEqual(caught.exception.code, 0)
 
-    def test_every_verb_through_phase_four_is_present(self):
+    def test_every_verb_through_phase_five_is_present(self):
         parser = cli.build_parser()
         actions = [a for a in parser._actions if a.dest == "verb"]
         self.assertEqual(
             sorted(actions[0].choices),
-            ["build", "doctor", "exec", "pull", "run", "sync", "test"],
+            ["build", "doctor", "exec", "init", "pull", "run", "sync", "test"],
         )
 
     def test_no_verb_from_a_later_phase_has_leaked_in(self):
@@ -515,6 +517,201 @@ class TestRefusesOnTheTarget(SequenceTestCase):
             cli.main(["--version"])
         self.assertEqual(caught.exception.code, 0)
         self.assertIn("perch", out.getvalue())
+
+
+class TestInit(unittest.TestCase):
+    """P5-3. Offline: Session is patched the same way TestDoctor patches it
+    (init ends by calling _run_doctor directly), and each test runs inside
+    a fresh temp directory since init scaffolds into the cwd."""
+
+    def setUp(self):
+        self.tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmpdir.cleanup)
+        self.original_cwd = os.getcwd()
+        os.chdir(self.tmpdir.name)
+        self.addCleanup(os.chdir, self.original_cwd)
+
+        self.probe_stdout = "PERCH:os=Debian\n"
+        self.probe_returncode = 0
+
+        def alive(self_session):
+            return False
+
+        def run_capturing(self_session, remote_command, *, input=None):
+            return FakeCompleted(returncode=self.probe_returncode, stdout=self.probe_stdout)
+
+        for target, name, replacement in (
+            (Session, "alive", alive),
+            (Session, "run_capturing", run_capturing),
+        ):
+            original = getattr(target, name)
+            setattr(target, name, replacement)
+            self.addCleanup(setattr, target, name, original)
+
+    def invoke(self, argv):
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            code = cli.main(argv)
+        return code, out.getvalue(), err.getvalue()
+
+    def test_writes_all_three_files_and_reports_them(self):
+        code, _, err = self.invoke(["init", "pi"])
+        self.assertEqual(code, 0)
+        self.assertTrue(Path(".perch.toml").is_file())
+        self.assertTrue(Path(".vscode/tasks.json").is_file())
+        self.assertTrue(Path("CLAUDE.md").is_file())
+        self.assertIn("wrote .perch.toml", err)
+        self.assertIn("wrote .vscode/tasks.json", err)
+        self.assertIn("wrote CLAUDE.md", err)
+
+    def test_generated_toml_parses_with_the_given_alias(self):
+        self.invoke(["init", "pi"])
+        cfg = config.load_file(Path(".perch.toml"))
+        self.assertEqual(cfg.host, "pi")
+        self.assertEqual(cfg.remote_root, f"perch/{Path.cwd().name}")
+
+    def test_generated_tasks_json_is_valid_jsonc(self):
+        import json
+        import re
+
+        self.invoke(["init", "pi"])
+        text = Path(".vscode/tasks.json").read_text()
+        no_comments = re.sub(r"^\s*//.*$", "", text, flags=re.M)
+        data = json.loads(no_comments)
+        self.assertEqual(
+            data["tasks"][0]["problemMatcher"]["fileLocation"], "absolute"
+        )
+
+    def test_generated_claude_md_states_the_core_rules(self):
+        self.invoke(["init", "pi"])
+        text = Path("CLAUDE.md").read_text()
+        self.assertIn("Never build or run", text)
+        self.assertIn("perch pull", text)
+
+    def test_does_not_overwrite_without_force(self):
+        Path(".perch.toml").write_text("# a sentinel the user wrote\n")
+        code, _, err = self.invoke(["init", "pi"])
+        self.assertEqual(Path(".perch.toml").read_text(), "# a sentinel the user wrote\n")
+        self.assertIn("already exists", err)
+
+    def test_force_overwrites(self):
+        Path(".perch.toml").write_text("# a sentinel the user wrote\n")
+        self.invoke(["init", "pi", "--force"])
+        self.assertIn('host = "pi"', Path(".perch.toml").read_text())
+
+    def test_rerun_is_idempotent(self):
+        self.invoke(["init", "pi"])
+        first = Path(".perch.toml").read_text()
+        code, _, err = self.invoke(["init", "pi"])
+        self.assertEqual(code, 0)
+        self.assertEqual(Path(".perch.toml").read_text(), first)
+        self.assertIn(".perch.toml already exists", err)
+
+    def test_guesses_make_from_a_makefile(self):
+        Path("Makefile").write_text("build:\n\techo hi\n")
+        self.invoke(["init", "pi"])
+        self.assertIn('build = "make"', Path(".perch.toml").read_text())
+
+    def test_guesses_python_build_from_pyproject_toml(self):
+        Path("pyproject.toml").write_text("[project]\nname = \"x\"\n")
+        self.invoke(["init", "pi"])
+        self.assertIn('build = "python3 -m build"', Path(".perch.toml").read_text())
+
+    def test_no_detected_project_type_leaves_build_commented(self):
+        self.invoke(["init", "pi"])
+        text = Path(".perch.toml").read_text()
+        self.assertIn('# build = "make"', text)
+        self.assertNotRegex(text, r"(?m)^build = ")
+
+    def test_makefile_takes_priority_over_pyproject(self):
+        Path("Makefile").write_text("build:\n\techo hi\n")
+        Path("pyproject.toml").write_text("[project]\nname = \"x\"\n")
+        self.invoke(["init", "pi"])
+        self.assertIn('build = "make"', Path(".perch.toml").read_text())
+
+    def test_ends_by_running_doctor(self):
+        self.probe_stdout = "PERCH:os=Some Distinctive OS String\n"
+        _, out, _ = self.invoke(["init", "pi"])
+        self.assertIn("Some Distinctive OS String", out)
+
+    def test_a_failing_doctor_probe_is_still_reported_not_swallowed(self):
+        self.probe_returncode = 1
+        code, _, err = self.invoke(["init", "pi"])
+        self.assertEqual(code, 70)
+        self.assertIn("perch:", err)
+
+
+class TestListSshAliases(unittest.TestCase):
+    def setUp(self):
+        self.tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmpdir.cleanup)
+        self.fake_home = Path(self.tmpdir.name)
+        patcher = patch.object(cli.Path, "home", return_value=self.fake_home)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def _write_ssh_config(self, text: str) -> None:
+        ssh_dir = self.fake_home / ".ssh"
+        ssh_dir.mkdir(parents=True, exist_ok=True)
+        (ssh_dir / "config").write_text(text)
+
+    def test_no_ssh_config_file_is_an_empty_list(self):
+        self.assertEqual(cli._list_ssh_aliases(), [])
+
+    def test_parses_simple_host_entries(self):
+        self._write_ssh_config("Host pi\n  HostName 10.0.0.131\n\nHost other\n  User x\n")
+        self.assertEqual(cli._list_ssh_aliases(), ["pi", "other"])
+
+    def test_skips_wildcard_and_negated_patterns(self):
+        self._write_ssh_config(
+            "Host 10.0.0.131\n  User a\n\nHost pi\n  User b\n\nHost *\n  AddKeysToAgent yes\n"
+        )
+        self.assertEqual(cli._list_ssh_aliases(), ["10.0.0.131", "pi"])
+
+    def test_multiple_patterns_on_one_line_considered_individually(self):
+        self._write_ssh_config("Host pi pi2 *.internal\n  User x\n")
+        self.assertEqual(cli._list_ssh_aliases(), ["pi", "pi2"])
+
+    def test_case_insensitive_host_keyword(self):
+        self._write_ssh_config("host pi\n  User x\n")
+        self.assertEqual(cli._list_ssh_aliases(), ["pi"])
+
+
+class TestChooseSshAlias(unittest.TestCase):
+    def setUp(self):
+        self.tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmpdir.cleanup)
+        self.fake_home = Path(self.tmpdir.name)
+        patcher = patch.object(cli.Path, "home", return_value=self.fake_home)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def _write_ssh_config(self, text: str) -> None:
+        ssh_dir = self.fake_home / ".ssh"
+        ssh_dir.mkdir(parents=True, exist_ok=True)
+        (ssh_dir / "config").write_text(text)
+
+    def test_no_aliases_raises_a_config_error(self):
+        with self.assertRaises(errors.ConfigError):
+            cli._choose_ssh_alias()
+
+    def test_non_tty_stdin_raises_rather_than_hangs(self):
+        self._write_ssh_config("Host pi\n  User x\n")
+        with patch.object(cli.sys.stdin, "isatty", return_value=False):
+            with self.assertRaises(errors.ConfigError):
+                cli._choose_ssh_alias()
+
+    def test_picks_the_chosen_index(self):
+        self._write_ssh_config("Host pi\n  User a\n\nHost other\n  User b\n")
+        with patch.object(cli.sys.stdin, "isatty", return_value=True), \
+             patch("builtins.input", return_value="2"):
+            self.assertEqual(cli._choose_ssh_alias(), "other")
+
+    def test_reprompts_on_an_invalid_choice(self):
+        self._write_ssh_config("Host pi\n  User a\n")
+        with patch.object(cli.sys.stdin, "isatty", return_value=True), \
+             patch("builtins.input", side_effect=["9", "abc", "1"]):
+            self.assertEqual(cli._choose_ssh_alias(), "pi")
 
 
 class TestParseProbeOutput(unittest.TestCase):
