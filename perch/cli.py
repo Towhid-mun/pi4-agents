@@ -150,30 +150,32 @@ def _dispatch(args: argparse.Namespace) -> int:
     if args.verb == "doctor":
         return _run_doctor(cfg, session)
 
-    # 3 Mirror. Raises SyncError (or a classified connection error) which
-    # aborts before step 5 (I4).
-    mirror.push(cfg, session)
-
-    if args.verb == "sync":
-        return errors.EXIT_OK
-
-    command = _command_for(cfg, args)
-
     tty = getattr(args, "tty", False)
     json_sink = getattr(args, "json", False)
     if tty and json_sink:
         # P2-5: a pty's streams are merged and carry control characters -
         # C5 (Phase 3) cannot classify that into structured events. Refused
-        # here, not deeper in, so this is a config error (64) rather than
-        # something that fails midway through a run.
+        # here, before touching the network at all, so this is a config
+        # error (64) rather than something that fails midway through a run.
         raise errors.ConfigError(
             "--tty and --json cannot be combined: a pty merges stdout and "
             "stderr into one stream, which cannot be classified into "
             "structured events"
         )
 
+    # 3 Mirror. Raises SyncError (or a classified connection error) which
+    # aborts before step 5 (I4). quiet=json_sink: P3-3 requires stdout carry
+    # only JSON in --json mode, and rsync's own itemized change list is tool
+    # progress, not part of the remote command's diagnostic stream.
+    mirror.push(cfg, session, quiet=json_sink)
+
+    if args.verb == "sync":
+        return errors.EXIT_OK
+
+    command = _command_for(cfg, args)
+
     # 5 Execute.
-    result = executor.run(cfg, command, session, tty=tty)
+    result = executor.run(cfg, command, session, tty=tty, json_mode=json_sink)
 
     # 7 Settle. Phase 0/1 settled by propagating the status alone; P2 adds
     # the interrupted/indeterminate outcomes C4 can now report. P2-6 requires

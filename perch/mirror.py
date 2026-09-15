@@ -82,7 +82,7 @@ def exclude_file_contents(cfg: Config) -> str:
     return "".join(f"{pattern}\n" for pattern in cfg.all_excludes)
 
 
-def push(cfg: Config, session: Session) -> None:
+def push(cfg: Config, session: Session, *, quiet: bool = False) -> None:
     """Mirror the host workspace onto the target.
 
     Raises SyncError on an rsync-specific failure, or whatever classified
@@ -90,6 +90,13 @@ def push(cfg: Config, session: Session) -> None:
     one is not rewrapped - it must keep its own exit code, e.g. 69, rather
     than becoming a generic 73). The caller MUST NOT execute anything against
     the tree if this raises - a partially synced tree is I4.
+
+    quiet=True (P3-3, --json): rsync's own itemized change list is TOOL
+    progress output, not part of the remote command's diagnostic stream -
+    in json_mode stdout carries only JSON events, so rsync's stdout is
+    dropped rather than leaking raw text onto it. stderr is left inherited
+    either way: a genuine rsync error still needs to reach the user, and
+    that path already goes through SyncError -> cli.py's own stderr print.
     """
     if not cfg.local_root.is_dir():
         raise SyncError(f"local root does not exist: {cfg.local_root}")
@@ -104,7 +111,7 @@ def push(cfg: Config, session: Session) -> None:
 
     try:
         argv = rsync_argv(cfg, exclude_from, session)
-        completed = _run(argv)
+        completed = _run(argv, quiet=quiet)
     finally:
         Path(exclude_from).unlink(missing_ok=True)
 
@@ -129,9 +136,10 @@ def _ensure_remote_root(cfg: Config, session: Session) -> None:
         )
 
 
-def _run(argv: list[str]) -> subprocess.CompletedProcess:
-    """Run rsync with stdio inherited, so its output arrives verbatim (I8)."""
+def _run(argv: list[str], *, quiet: bool = False) -> subprocess.CompletedProcess:
+    """Run rsync with stdio inherited, so its output arrives verbatim (I8) -
+    unless quiet, which drops only stdout (see push()'s docstring)."""
     try:
-        return subprocess.run(argv)
+        return subprocess.run(argv, stdout=subprocess.DEVNULL if quiet else None)
     except FileNotFoundError as exc:
         raise SyncError(f"{argv[0]} not found on this machine: {exc}") from exc

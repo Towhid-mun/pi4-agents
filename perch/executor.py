@@ -20,6 +20,7 @@ Two modes:
 """
 
 import hashlib
+import json
 import os
 import secrets
 import selectors
@@ -273,7 +274,7 @@ class _SignalState:
         self.count += 1
 
 
-def _run_pipes(cfg: Config, command: str, session: Session) -> RunResult:
+def _run_pipes(cfg: Config, command: str, session: Session, *, json_mode: bool = False) -> RunResult:
     """Run `command` in the remote project root, streaming output as it arrives.
 
     Reads stdout and stderr with `selectors` (P2-1) so neither stream can
@@ -291,6 +292,14 @@ def _run_pipes(cfg: Config, command: str, session: Session) -> RunResult:
     Before any of that: if a previous run for this project left a live
     group (this host process was SIGKILLed mid-run, which the ADR-5 wrapper
     survives on purpose), reap it first (P2-4).
+
+    json_mode (P3-3): every line becomes a `{"t": "stdout"/"stderr", ...}`
+    event, a recognized primary diagnostic ALSO gets its own `diag` event,
+    and a terminal `exit` event is always emitted before returning - in
+    every outcome, not just a clean one. All of it goes on stdout, which in
+    this mode carries nothing else at all; anything perch itself needs to
+    say (P2-4's reaping notice, P2-6's indeterminate/interrupted wording)
+    already goes to stderr regardless of mode.
     """
     reap_stale_group(cfg, session)
     resolver = diagnostics.PathResolver(cfg.local_root, cfg.remote_root)
@@ -322,20 +331,45 @@ def _run_pipes(cfg: Config, command: str, session: Session) -> RunResult:
     outcome = "normal"  # normal | interrupted_confirmed | interrupted_unconfirmed
     broken = {"stdout": False, "stderr": False}  # our OWN downstream consumer went away
 
-    def for_display(line: str) -> str:
+    def for_display(line: str) -> tuple[str, diagnostics.Diagnostic | None]:
         """C5: strip ANSI, track the compiler's remote cwd (P3-2's
         `make -C subdir` trap), and rewrite a recognized diagnostic's path
         to a local one. A line that is not a diagnostic - the overwhelming
-        common case - comes back with nothing touched but the ANSI strip.
+        common case - comes back with nothing touched but the ANSI strip,
+        and no diagnostic. The diagnostic, when present, is what json_mode
+        turns into a `diag` event (P3-3) - plain-text mode ignores it.
         """
         clean = diagnostics.strip_ansi(line)
         resolver.observe(clean)
         diag = diagnostics.parse_line(clean)
         if diag is None:
-            return clean
-        return diagnostics.rewrite_line(clean, diag, resolver)
+            return clean, None
+        return diagnostics.rewrite_line(clean, diag, resolver), diag
+
+    def write_json(event: dict) -> None:
+        # Requirement 1: in json_mode EVERY event goes on stdout regardless
+        # of which logical stream (stdout/stderr) its line came from -
+        # "stdout carries ONLY JSON" means one stream, not two. Tracked
+        # under the same "stdout" broken-pipe flag as plain-text mode uses.
+        if broken["stdout"]:
+            return
+        try:
+            sys.stdout.write(json.dumps(event) + "\n")
+            sys.stdout.flush()  # requirement 2: flush every event
+        except BrokenPipeError:
+            broken["stdout"] = True
+            devnull = os.open(os.devnull, os.O_WRONLY)
+            os.dup2(devnull, sys.stdout.fileno())
+            os.close(devnull)
 
     def emit(stream: str, line: str, *, had_newline: bool = True) -> None:
+        display, diag = for_display(line)
+        if json_mode:
+            write_json(diagnostics.event_for_stream(stream, display))
+            if diag is not None and diagnostics.is_event(diag):
+                resolved = resolver.resolve(diag.file) or diag.file
+                write_json(diagnostics.diag_event(diag, resolved))
+            return
         # Trap 3: our own stdout/stderr are block-buffered when not a
         # terminal. Flush every line explicitly.
         if broken[stream]:
@@ -346,7 +380,7 @@ def _run_pipes(cfg: Config, command: str, session: Session) -> RunResult:
             # fabricating a trailing newline the source never had is still
             # corrupting the output, just subtly - caught live against the
             # noise fixture, whose last line deliberately has none).
-            out.write(for_display(line) + ("\n" if had_newline else ""))
+            out.write(display + ("\n" if had_newline else ""))
             out.flush()
         except BrokenPipeError:
             # Our own local consumer (e.g. `perch build | head`) went away.
@@ -451,17 +485,33 @@ def _run_pipes(cfg: Config, command: str, session: Session) -> RunResult:
         returncode = proc.wait()
 
     if outcome == "interrupted_confirmed":
-        return RunResult(exit_code=returncode, interrupted=True)
-    if outcome == "interrupted_unconfirmed":
+        result = RunResult(exit_code=returncode, interrupted=True)
+    elif outcome == "interrupted_unconfirmed":
         # NEVER claim confirmed-dead (I7) without confirmation - this is
         # indeterminate, not interrupted, even though a human caused it.
-        return RunResult(exit_code=returncode, indeterminate=True)
-    if captured["exit_code"] is None:
+        result = RunResult(exit_code=returncode, indeterminate=True)
+    elif captured["exit_code"] is None:
         # Stream ended without the exit sentinel - P2-6. Not success, not
         # failure. Leave the pgid record alone: we don't know it's dead.
-        return RunResult(exit_code=returncode, indeterminate=True)
-    _clear_pgid_record(cfg)
-    return RunResult(exit_code=captured["exit_code"])
+        result = RunResult(exit_code=returncode, indeterminate=True)
+    else:
+        _clear_pgid_record(cfg)
+        result = RunResult(exit_code=captured["exit_code"])
+
+    if json_mode:
+        # Requirement 3: always emitted, in every outcome - a consumer must
+        # never be left waiting to find out how the run ended. `code` here
+        # is the raw remote/local value (ARCHITECTURE.md's own example,
+        # {"t": "exit", "code": 1, ...} - a plausible remote failure code,
+        # not a tool-level one); errors.exit_code_for_run's mapping is what
+        # this PROCESS exits with, a separate concern from what this event
+        # reports about the RUN.
+        write_json(
+            diagnostics.exit_event(
+                result.exit_code, interrupted=result.interrupted, indeterminate=result.indeterminate
+            )
+        )
+    return result
 
 
 # --------------------------------------------------------------------------
@@ -504,13 +554,16 @@ def _run_pty(cfg: Config, command: str, session: Session) -> RunResult:
 # Public entry point.
 # --------------------------------------------------------------------------
 
-def run(cfg: Config, command: str, session: Session, *, tty: bool = False) -> RunResult:
+def run(
+    cfg: Config, command: str, session: Session, *, tty: bool = False, json_mode: bool = False
+) -> RunResult:
     """Run `command` in the remote project root and propagate its outcome.
 
     Pipe mode (default) carries I5/I6/I7 in full - see _run_pipes. PTY mode
     (--tty) trades stream separation for native signal delivery (ADR-2) and
-    is never the default.
+    is never the default. json_mode (P3-3) is a pipe-mode-only concept -
+    cli.py already refuses --tty --json before this is ever called with both.
     """
     if tty:
         return _run_pty(cfg, command, session)
-    return _run_pipes(cfg, command, session)
+    return _run_pipes(cfg, command, session, json_mode=json_mode)

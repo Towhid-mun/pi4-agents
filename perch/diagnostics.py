@@ -257,3 +257,43 @@ def rewrite_line(line: str, diagnostic: Diagnostic, resolver: PathResolver) -> s
         return line
     start, end = diagnostic.file_span
     return line[:start] + local + line[end:]
+
+
+# --------------------------------------------------------------------------
+# P3-3: the structured event stream. ARCHITECTURE.md §5/C5 gives the schema
+# for stdout/stderr/diag events verbatim - these are exactly that shape.
+# `exit` gains an `indeterminate` field beyond what ARCHITECTURE.md shows:
+# that document predates P2-6, which is where "indeterminate" as a distinct
+# outcome (not success, not failure, not merely "interrupted") was designed.
+# Without this field a --json consumer would have to know that exit code 74
+# specifically means indeterminate - exactly the kind of implicit knowledge
+# structured events exist to avoid. Flagged as a deliberate extension, not a
+# silent deviation.
+# --------------------------------------------------------------------------
+
+
+def stdout_event(line: str) -> dict:
+    return {"t": "stdout", "line": line}
+
+
+def stderr_event(line: str) -> dict:
+    return {"t": "stderr", "line": line}
+
+
+def event_for_stream(stream: str, line: str) -> dict:
+    return stdout_event(line) if stream == "stdout" else stderr_event(line)
+
+
+def diag_event(diagnostic: Diagnostic, resolved_file: str) -> dict:
+    return {
+        "t": "diag",
+        "file": resolved_file,
+        "line": diagnostic.line,
+        "col": diagnostic.col,
+        "severity": diagnostic.severity,
+        "message": diagnostic.message,
+    }
+
+
+def exit_event(code: int, *, interrupted: bool, indeterminate: bool) -> dict:
+    return {"t": "exit", "code": code, "interrupted": interrupted, "indeterminate": indeterminate}

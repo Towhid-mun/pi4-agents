@@ -42,14 +42,16 @@ class SequenceTestCase(unittest.TestCase):
             self.calls.append(("resolve", None))
             return self.cfg
 
-        def push(cfg, session):
+        def push(cfg, session, *, quiet=False):
             self.calls.append(("mirror", None))
+            self.last_quiet = quiet
             if self.sync_error is not None:
                 raise self.sync_error
 
-        def run(cfg, command, session, *, tty=False):
+        def run(cfg, command, session, *, tty=False, json_mode=False):
             self.calls.append(("execute", command))
             self.last_tty = tty
+            self.last_json_mode = json_mode
             return executor.RunResult(exit_code=self.exit_code)
 
         for module, name, replacement in (
@@ -165,11 +167,24 @@ class TestTtyAndJson(SequenceTestCase):
         self.assertIn("--json", err)
         self.assertNotIn("execute", [step for step, _ in self.calls])
 
-    def test_json_alone_is_accepted_for_now(self):
-        # --json is recognized now (P2-5's combination check needs it to
-        # exist) but does nothing on its own until P3-3.
-        code, _, _ = self.invoke(["build", "--json"])
-        self.assertEqual(code, 0)
+    def test_json_reaches_the_executor(self):
+        self.invoke(["build", "--json"])
+        self.assertTrue(self.last_json_mode)
+
+    def test_json_defaults_to_false(self):
+        self.invoke(["build"])
+        self.assertFalse(self.last_json_mode)
+
+    def test_json_quiets_the_mirror(self):
+        # P3-3 requirement 1: stdout carries only JSON events in this mode -
+        # rsync's own itemized change list is tool progress, not part of
+        # that stream.
+        self.invoke(["build", "--json"])
+        self.assertTrue(self.last_quiet)
+
+    def test_no_json_does_not_quiet_the_mirror(self):
+        self.invoke(["build"])
+        self.assertFalse(self.last_quiet)
 
     def test_tty_works_on_exec_too(self):
         self.invoke(["exec", "--tty", "true"])
@@ -182,7 +197,7 @@ class TestSettleOutcomes(SequenceTestCase):
     the number half of this contract."""
 
     def run_with(self, **result_kwargs):
-        def run(cfg, command, session, *, tty=False):
+        def run(cfg, command, session, *, tty=False, json_mode=False):
             self.calls.append(("execute", command))
             return executor.RunResult(exit_code=result_kwargs.pop("exit_code", 1), **result_kwargs)
 

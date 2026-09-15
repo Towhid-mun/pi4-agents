@@ -398,5 +398,66 @@ class TestRewriteLine(unittest.TestCase):
         self.assertTrue(Path(rewritten.split(":")[0]).is_absolute())
 
 
+class TestJsonEvents(unittest.TestCase):
+    """P3-3's event schema (ARCHITECTURE.md §5/C5). Every event must survive
+    a real json.dumps/json.loads round trip - that's the actual requirement
+    ("every line parses as JSON"), not just "looks like the right dict"."""
+
+    def test_stdout_and_stderr_events_match_the_schema_exactly(self):
+        import json
+
+        self.assertEqual(json.loads(json.dumps(diagnostics.stdout_event("hello"))),
+                          {"t": "stdout", "line": "hello"})
+        self.assertEqual(json.loads(json.dumps(diagnostics.stderr_event("oops"))),
+                          {"t": "stderr", "line": "oops"})
+
+    def test_event_for_stream_dispatches_correctly(self):
+        self.assertEqual(diagnostics.event_for_stream("stdout", "x")["t"], "stdout")
+        self.assertEqual(diagnostics.event_for_stream("stderr", "x")["t"], "stderr")
+
+    def test_diag_event_matches_the_schema_exactly(self):
+        import json
+
+        diag = parse_line("single_error.c:5:22: error: bad thing")
+        event = diagnostics.diag_event(diag, "/local/single_error.c")
+        self.assertEqual(
+            json.loads(json.dumps(event)),
+            {
+                "t": "diag", "file": "/local/single_error.c", "line": 5, "col": 22,
+                "severity": "error", "message": "bad thing",
+            },
+        )
+
+    def test_exit_event_matches_architecture_mds_example_shape(self):
+        # ARCHITECTURE.md §5/C5: {"t": "exit", "code": 1, "interrupted": false}
+        # - "indeterminate" is an addition this codebase makes (P2-6 postdates
+        # that schema); confirmed present alongside, not instead of, the
+        # documented fields.
+        import json
+
+        event = diagnostics.exit_event(1, interrupted=False, indeterminate=False)
+        parsed = json.loads(json.dumps(event))
+        self.assertEqual(parsed["t"], "exit")
+        self.assertEqual(parsed["code"], 1)
+        self.assertEqual(parsed["interrupted"], False)
+        self.assertIn("indeterminate", parsed)
+
+    def test_every_recognized_fixture_line_produces_a_json_serializable_event(self):
+        # Every diag this module can produce, from every real fixture, must
+        # survive json.dumps - including gcc's curly quotes and any other
+        # non-ASCII text in a real message.
+        import json
+
+        for fixture in (
+            "single_error.stderr.txt", "multi_error.stderr.txt", "warnings_only.stderr.txt",
+            "linker_error.stderr.txt", "include_chain.stderr.txt", "traceback.stderr.txt",
+            "make_subdir.stderr.txt",
+        ):
+            for line in lines_of(fixture):
+                diag = parse_line(line)
+                if diag is not None:
+                    json.dumps(diagnostics.diag_event(diag, diag.file))  # must not raise
+
+
 if __name__ == "__main__":
     unittest.main()
