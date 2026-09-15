@@ -174,8 +174,22 @@ def _dispatch(args: argparse.Namespace) -> int:
     result = executor.run(cfg, command, session, tty=tty)
 
     # 7 Settle. Phase 0/1 settled by propagating the status alone; P2 adds
-    # the interrupted/indeterminate outcomes C4 can now report (I7's exit
-    # 130 must be confirmed-dead, never assumed - see executor.run()).
+    # the interrupted/indeterminate outcomes C4 can now report. P2-6 requires
+    # the word itself, not just the number - a caller reading only an exit
+    # code cannot tell 74-for-a-reboot apart from any other tool failure.
+    if result.indeterminate:
+        print(
+            "perch: indeterminate - the channel closed without an exit status "
+            "(the target likely rebooted or the network dropped mid-run). "
+            "Not success, not failure. The next invocation reconnects unaided.",
+            file=sys.stderr,
+        )
+    elif result.interrupted:
+        print(
+            "perch: interrupted - the remote process group was signalled and "
+            "confirmed dead.",
+            file=sys.stderr,
+        )
     return errors.exit_code_for_run(
         result.exit_code, interrupted=result.interrupted, indeterminate=result.indeterminate
     )

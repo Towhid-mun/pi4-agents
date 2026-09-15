@@ -176,6 +176,42 @@ class TestTtyAndJson(SequenceTestCase):
         self.assertTrue(self.last_tty)
 
 
+class TestSettleOutcomes(SequenceTestCase):
+    """P2-6: the interrupted/indeterminate outcomes C4 can report must say
+    the word, not just choose the number - see errors.exit_code_for_run for
+    the number half of this contract."""
+
+    def run_with(self, **result_kwargs):
+        def run(cfg, command, session, *, tty=False):
+            self.calls.append(("execute", command))
+            return executor.RunResult(exit_code=result_kwargs.pop("exit_code", 1), **result_kwargs)
+
+        executor.run = run
+        return self.invoke(["build"])
+
+    def test_indeterminate_exits_74_and_says_the_word(self):
+        code, _, err = self.run_with(indeterminate=True)
+        self.assertEqual(code, 74)
+        self.assertIn("indeterminate", err)
+
+    def test_interrupted_confirmed_exits_130(self):
+        code, _, err = self.run_with(interrupted=True)
+        self.assertEqual(code, 130)
+        self.assertIn("interrupted", err)
+
+    def test_indeterminate_wins_over_interrupted(self):
+        # Mirrors errors.exit_code_for_run's own precedence.
+        code, _, err = self.run_with(interrupted=True, indeterminate=True)
+        self.assertEqual(code, 74)
+        self.assertIn("indeterminate", err)
+
+    def test_ordinary_completion_prints_neither_word(self):
+        code, _, err = self.run_with(exit_code=0)
+        self.assertEqual(code, 0)
+        self.assertNotIn("indeterminate", err)
+        self.assertNotIn("interrupted", err)
+
+
 class TestArgumentSurface(unittest.TestCase):
     def test_usage_error_does_not_land_in_the_remote_failure_band(self):
         err = io.StringIO()
