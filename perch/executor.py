@@ -34,6 +34,7 @@ from pathlib import Path
 
 import signal as signal_module
 
+from perch import diagnostics
 from perch.config import Config
 from perch.errors import InternalError, TargetUnreachable
 from perch.session import Session
@@ -320,14 +321,23 @@ def _run_pipes(cfg: Config, command: str, session: Session) -> RunResult:
     outcome = "normal"  # normal | interrupted_confirmed | interrupted_unconfirmed
     broken = {"stdout": False, "stderr": False}  # our OWN downstream consumer went away
 
-    def emit(stream: str, line: str) -> None:
+    def emit(stream: str, line: str, *, had_newline: bool = True) -> None:
         # Trap 3: our own stdout/stderr are block-buffered when not a
         # terminal. Flush every line explicitly.
         if broken[stream]:
             return
         out = sys.stdout if stream == "stdout" else sys.stderr
         try:
-            out.write(line + "\n")
+            # C5/P3-1: strip ANSI before the user ever sees it. Colour codes
+            # forced via -fdiagnostics-color=always are pointless noise once
+            # captured into a non-terminal pipe (they defeat the diagnostic
+            # regex too, which is the other reason this has to happen before
+            # anything else looks at the line). had_newline=False for a
+            # genuine final unterminated line (I8: fabricating a trailing
+            # newline the source never had is still corrupting the output,
+            # just subtly - caught live against the noise fixture, whose
+            # last line deliberately has none).
+            out.write(diagnostics.strip_ansi(line) + ("\n" if had_newline else ""))
             out.flush()
         except BrokenPipeError:
             # Our own local consumer (e.g. `perch build | head`) went away.
@@ -341,20 +351,25 @@ def _run_pipes(cfg: Config, command: str, session: Session) -> RunResult:
             os.dup2(devnull, out.fileno())
             os.close(devnull)
 
-    def handle_line(stream: str, raw: bytes) -> None:
+    def handle_line(stream: str, raw: bytes, *, had_newline: bool) -> None:
         line = raw.decode("utf-8", errors="replace")
         kind = classify_line(line, token)
         if kind is None:
-            emit(stream, line)
+            emit(stream, line, had_newline=had_newline)
             return
         marker_kind, value, leading = kind
         if leading:
-            emit(stream, leading)  # a genuine final partial line, glued to the marker
+            # A genuine final partial line, glued to the marker - the marker
+            # itself supplied the only \n on the wire, so the user's own
+            # content here never actually had one (that is WHY it got glued
+            # in the first place; a properly terminated last line would have
+            # been its own, separate, ordinary line instead).
+            emit(stream, leading, had_newline=False)
         if marker_kind == "pgid":
             try:
                 captured["pgid"] = int(value)
             except ValueError:
-                emit(stream, line)  # garbled marker - show it rather than trust it
+                emit(stream, line, had_newline=had_newline)  # garbled marker - show it rather than trust it
                 return
             # Recorded immediately, not deferred to a clean exit - if THIS
             # host process gets SIGKILLed a moment from now, the next
@@ -375,7 +390,10 @@ def _run_pipes(cfg: Config, command: str, session: Session) -> RunResult:
             sel.unregister(fileobj)
             open_streams.discard(stream)
             if buffers[stream]:
-                handle_line(stream, bytes(buffers[stream]))
+                # Reached EOF with no trailing \n for this leftover - by
+                # definition it never had one on the wire (if it had, it
+                # would already have been split out and handled above).
+                handle_line(stream, bytes(buffers[stream]), had_newline=False)
                 buffers[stream].clear()
             return
         buffers[stream].extend(chunk)
@@ -383,7 +401,7 @@ def _run_pipes(cfg: Config, command: str, session: Session) -> RunResult:
             idx = buffers[stream].find(b"\n")
             if idx == -1:
                 break
-            handle_line(stream, bytes(buffers[stream][:idx]))
+            handle_line(stream, bytes(buffers[stream][:idx]), had_newline=True)
             del buffers[stream][: idx + 1]
 
     try:

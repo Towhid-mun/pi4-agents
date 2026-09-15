@@ -66,14 +66,26 @@ filled in as each ticket lands; this section is the running record.
   `ls` check trivially) vs. a path relative to the caller's own cwd (matches
   what a local compiler invocation would print, but needs an extra piece of
   context C1 does not currently provide). Decided in the P3-2 commit.
-- **ANSI escape sequences**: TBD at P3-1 - strip-before-matching is
-  required regardless (colour codes inside a path defeat the regex); whether
-  the *emitted* text keeps or drops them is decided once real coloured
-  output (if any) is seen from this target's gcc.
-- **`make -C subdir` cwd tracking**: TBD at P3-2 - depends on whether GNU
-  Make on this target actually prints `Entering directory`/`Leaving
-  directory` announcements by default, checked empirically in the P3-4
-  fixture capture rather than assumed from memory.
+- **ANSI escape sequences (decided, P3-1)**: stripped, both for matching AND
+  for what the user sees - never kept. `-fdiagnostics-color=always` produces
+  real escapes sitting directly before the filename (confirmed by raw byte
+  capture, `single_error_color.stderr.txt`), so stripping before matching is
+  mandatory regardless. Stripping the *displayed* text too, rather than only
+  the copy used for matching, was chosen because: our own pipe-mode wrapper
+  never allocates a remote tty, so gcc only emits colour at all when
+  explicitly forced - there is no legitimate "the user's real terminal wants
+  this colour" case to preserve; a JSON event's `message` field (P3-3)
+  carrying raw control bytes would be actively harmful to any consumer; and
+  keeping colour would mean reconstructing a rewritten diagnostic line (P3-2)
+  around embedded escape codes without corrupting them, for no real benefit.
+  Verified live through the full pipeline, not just offline: `perch exec gcc
+  -fdiagnostics-color=always ...` produces plain text (`cat -v` shows no
+  `^[` sequences).
+- **`make -C subdir` cwd tracking (confirmed empirically, P3-4)**: GNU Make
+  4.4.1 on this target DOES print `make: Entering directory '/abs/path'` /
+  `Leaving directory` on **stdout** by default under `-C`, no flag needed -
+  see `tests/fixtures/make_subdir.stdout.txt`. P3-2's cwd tracking watches
+  for exactly this line shape.
 
 ## Offline test suite
 
