@@ -1,0 +1,8 @@
+Traceback (most recent call last):
+  File "/home/towhid/perch-diag-capture/traceback.py", line 9, in <module>
+    outer()
+  File "/home/towhid/perch-diag-capture/traceback.py", line 6, in outer
+    return inner(0)
+  File "/home/towhid/perch-diag-capture/traceback.py", line 2, in inner
+    return 10 / x
+ZeroDivisionError: division by zero

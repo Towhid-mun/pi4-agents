@@ -1,0 +1,2 @@
+host = "pi"
+remote_root = "perch-diag-capture"

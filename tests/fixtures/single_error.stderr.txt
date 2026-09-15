@@ -1,0 +1,7 @@
+single_error.c: In function ‘main’:
+single_error.c:5:22: error: expected ‘;’ before ‘return’
+    5 |     printf("%d\n", x)
+      |                      ^
+      |                      ;
+    6 |     return 0;
+      |     ~~~~~~            

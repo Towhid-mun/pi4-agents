@@ -1,0 +1,1 @@
+single_error.c:5:22: error: bad byte follows -> ÿþ <- and continues

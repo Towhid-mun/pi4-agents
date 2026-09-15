@@ -1,0 +1,3 @@
+/usr/bin/ld: /tmp/ccIlWxtk.o: in function `main':
+linker_main.c:(.text+0xc): undefined reference to `undefined_function'
+collect2: error: ld returned 1 exit status

@@ -1,0 +1,7 @@
+warnings_only.c: In function ‘main’:
+warnings_only.c:6:9: warning: suggest parentheses around assignment used as truth value [-Wparentheses]
+    6 |     if (a = 6) {
+      |         ^
+warnings_only.c:4:9: warning: unused variable ‘unused’ [-Wunused-variable]
+    4 |     int unused;
+      |         ^~~~~~

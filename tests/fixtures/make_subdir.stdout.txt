@@ -1,0 +1,3 @@
+make: Entering directory '/home/towhid/perch-diag-capture/subdir'
+gcc -Wall -o sub_error sub_error.c
+make: Leaving directory '/home/towhid/perch-diag-capture/subdir'

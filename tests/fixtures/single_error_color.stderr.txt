@@ -1,0 +1,7 @@
+[01m[Ksingle_error.c:[m[K In function ‘[01m[Kmain[m[K’:
+[01m[Ksingle_error.c:5:22:[m[K [01;31m[Kerror: [m[Kexpected ‘[01m[K;[m[K’ before ‘[01m[Kreturn[m[K’
+    5 |     printf("%d\n", x)
+      |                      [01;31m[K^[m[K
+      |                      [32m[K;[m[K
+    6 |     [32m[Kreturn[m[K 0;
+      |     [32m[K~~~~~~[m[K            

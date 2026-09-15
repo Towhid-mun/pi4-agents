@@ -1,0 +1,6 @@
+sub_error.c: In function ‘main’:
+sub_error.c:4:20: error: ‘missing_symbol’ undeclared (first use in this function)
+    4 |     printf("%d\n", missing_symbol);
+      |                    ^~~~~~~~~~~~~~
+sub_error.c:4:20: note: each undeclared identifier is reported only once for each function it appears in
+make: *** [Makefile:2: sub_error] Error 1

@@ -1,0 +1,14 @@
+multi_error.c: In function ‘main’:
+multi_error.c:5:5: error: expected ‘,’ or ‘;’ before ‘int’
+    5 |     int y = undeclared_variable;
+      |     ^~~
+multi_error.c:6:26: error: ‘y’ undeclared (first use in this function)
+    6 |     printf("%d %d\n", x, y);
+      |                          ^
+multi_error.c:6:26: note: each undeclared identifier is reported only once for each function it appears in
+multi_error.c:7:13: error: expected ‘;’ before ‘}’ token
+    7 |     return 0
+      |             ^
+      |             ;
+    8 | }
+      | ~            

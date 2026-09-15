@@ -1,0 +1,8 @@
+12:34:56 INFO starting up
+/usr/bin/gcc: this looks like a compiler but is not one: 404
+src/main.c: this has a colon but no line:col shape at all
+error: standalone word 'error' with no file prefix
+/home/towhid/perch-diag-capture/data.bin: 42:17 not a diagnostic, just numbers
+warning level: 3, retry count: 12
+config.yaml:not-a-number:also-not-a-number: weird but not gcc shaped
+no newline at all, just a bare colon: and done
