@@ -10,6 +10,7 @@ import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import dataclass
 from pathlib import Path
+from unittest.mock import patch
 
 from perch import artifacts, cli, config, errors, executor, mirror
 from perch.session import Session
@@ -479,6 +480,41 @@ class TestDoctor(unittest.TestCase):
         code, _, err = self.invoke()
         self.assertEqual(code, 70)
         self.assertIn("perch:", err)
+
+
+class TestRefusesOnTheTarget(SequenceTestCase):
+    """P5-1. The real device this guards against is a VS Code window
+    connected to the Pi over Remote-SSH, where a task's shell runs ON the
+    Pi - not reproducible here, so this patches platform.system() instead."""
+
+    def test_non_macos_refuses_before_config_resolution(self):
+        with patch.object(cli.platform, "system", return_value="Linux"):
+            code, _, err = self.invoke(["build"])
+        self.assertEqual(code, 64)
+        self.assertIn("Remote-SSH", err)
+        self.assertEqual(self.calls, [])  # never even reached config.load()
+
+    def test_macos_is_unaffected(self):
+        with patch.object(cli.platform, "system", return_value="Darwin"):
+            code, _, _ = self.invoke(["build"])
+        self.assertEqual(code, 0)
+
+    def test_names_the_actual_system_and_machine(self):
+        with patch.object(cli.platform, "system", return_value="Linux"), \
+             patch.object(cli.platform, "machine", return_value="aarch64"):
+            _, _, err = self.invoke(["build"])
+        self.assertIn("Linux", err)
+        self.assertIn("aarch64", err)
+
+    def test_help_and_version_are_unaffected(self):
+        # argparse handles these before _dispatch ever runs - the guard
+        # must not somehow block the one thing that works everywhere.
+        out = io.StringIO()
+        with patch.object(cli.platform, "system", return_value="Linux"), \
+             redirect_stdout(out), self.assertRaises(SystemExit) as caught:
+            cli.main(["--version"])
+        self.assertEqual(caught.exception.code, 0)
+        self.assertIn("perch", out.getvalue())
 
 
 class TestParseProbeOutput(unittest.TestCase):

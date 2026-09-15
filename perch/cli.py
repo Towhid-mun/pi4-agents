@@ -12,6 +12,7 @@ step 7 is P4-2.
 """
 
 import argparse
+import platform
 import shutil
 import subprocess
 import sys
@@ -189,7 +190,35 @@ def main(argv: list[str] | None = None) -> int:
         return errors.exit_code_for(errors.IndeterminateRun())
 
 
+def _refuse_if_running_on_the_target() -> None:
+    """P5-1. ARCHITECTURE.md §1 fixes Host as macOS - perch itself is meant
+    to run there and ssh OUT to the target, never the reverse. The
+    realistic way this gets violated by accident is a VS Code window
+    connected to the Pi over Remote-SSH: a task's shell then runs ON the
+    Pi, and `perch` (which itself shells out to `ssh <alias>`) would try
+    to ssh from the Pi to itself - or, since the Pi has its own separate
+    `~/.ssh/config`, more likely just fail to resolve the alias at all.
+    Either way that is a confusing, working-looking failure days away
+    from this one obvious cause, not a clean error - so it is checked and
+    refused here, before config resolution or any network activity,
+    rather than left to surface however the connection attempt happens to
+    fail. See docs/PHASE-5-BUILD-AND-RUN.md for what the confusing
+    failure actually looks like when this check is bypassed (e.g. by
+    running perch on some other non-macOS host on purpose).
+    """
+    if platform.system() != "Darwin":
+        raise errors.ConfigError(
+            f"this looks like {platform.system()} ({platform.machine()}), "
+            "not macOS - perch must run on the HOST, never the target. If "
+            "this is a VS Code window connected to the Pi over Remote-SSH, "
+            "close it and reopen the project as a plain LOCAL window (see "
+            "docs/PHASE-5-BUILD-AND-RUN.md)."
+        )
+
+
 def _dispatch(args: argparse.Namespace) -> int:
+    _refuse_if_running_on_the_target()
+
     # 1 Resolve. Fail on an unresolvable target before doing anything else.
     cfg = config.load()
 
